@@ -11,9 +11,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: DATABASE_URL
-        fromDatabase:
-          name: abr-ondas-db
-          property: connectionString
+        sync: false
       - key: FRONTEND_URL
         value: https://abr-ondas-email.grupoabr.chatgpt.site
       - key: MICROSOFT_SENDER_EMAIL
@@ -28,9 +26,3 @@ services:
         generateValue: true
       - key: TRACKING_SECRET
         generateValue: true
-
-databases:
-  - name: abr-ondas-db
-    plan: free
-    databaseName: abr_ondas
-    user: abr_ondas
