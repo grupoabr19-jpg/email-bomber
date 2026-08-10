@@ -55,6 +55,8 @@ async function initializeDatabase() {
         audience_label TEXT NOT NULL DEFAULT 'Todos os contatos', status TEXT NOT NULL DEFAULT 'draft',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
+      await pool.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS brief TEXT NOT NULL DEFAULT ''`);
+      await pool.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS source_references JSONB NOT NULL DEFAULT '[]'::jsonb`);
       await pool.query(`CREATE TABLE IF NOT EXISTS campaign_waves (
         id BIGSERIAL PRIMARY KEY, campaign_id BIGINT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
         wave_order INTEGER NOT NULL, scheduled_at TIMESTAMPTZ, recipient_count INTEGER NOT NULL DEFAULT 0,
@@ -64,6 +66,13 @@ async function initializeDatabase() {
         id BIGSERIAL PRIMARY KEY, campaign_id BIGINT REFERENCES campaigns(id) ON DELETE SET NULL,
         contact_id BIGINT REFERENCES contacts(id) ON DELETE SET NULL, event_type TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS campaign_emails (
+        id BIGSERIAL PRIMARY KEY, campaign_id BIGINT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+        wave_id BIGINT NOT NULL REFERENCES campaign_waves(id) ON DELETE CASCADE,
+        subject TEXT NOT NULL, html_content TEXT NOT NULL DEFAULT '', preview_text TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'draft', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(campaign_id, wave_id)
       )`);
       await pool.query(
         `INSERT INTO users (email, name, role) VALUES ($1, $2, 'admin') ON CONFLICT (email) DO NOTHING`,
@@ -113,21 +122,40 @@ app.get("/api/dashboard", requireServiceKey, requireDatabase, async (_req, res, 
 });
 
 app.get("/api/campaigns", requireServiceKey, requireDatabase, async (_req, res, next) => {
-  try { const result = await pool.query(`SELECT c.id,c.name,c.subject,c.status,c.audience_label,c.sender_name,c.sender_email,c.created_at,COALESCE(SUM(w.recipient_count),0)::int AS recipients,COUNT(w.id)::int AS waves,MIN(w.scheduled_at) AS next_send FROM campaigns c LEFT JOIN campaign_waves w ON w.campaign_id=c.id GROUP BY c.id ORDER BY c.created_at DESC`); res.json({ campaigns: result.rows }); } catch (error) { next(error); }
+  try { const result = await pool.query(`SELECT c.id,c.name,c.subject,c.brief,c.source_references,c.status,c.audience_label,c.sender_name,c.sender_email,c.created_at,COALESCE(SUM(w.recipient_count),0)::int AS recipients,COUNT(w.id)::int AS waves,MIN(w.scheduled_at) AS next_send FROM campaigns c LEFT JOIN campaign_waves w ON w.campaign_id=c.id GROUP BY c.id ORDER BY c.created_at DESC`); res.json({ campaigns: result.rows }); } catch (error) { next(error); }
 });
 
 app.post("/api/campaigns", requireServiceKey, requireDatabase, async (req, res, next) => {
-  const { name, subject, htmlContent = "", senderName = "Grupo ABR", senderEmail = process.env.MICROSOFT_SENDER_EMAIL || "", audienceLabel = "Todos os contatos", waves = 1, firstSendAt } = req.body || {};
-  if (!name?.trim() || !subject?.trim()) return res.status(400).json({ error: "Nome e assunto são obrigatórios" });
+  const { name, brief = "", sourceReferences = [], senderName = "Grupo ABR", senderEmail = process.env.MICROSOFT_SENDER_EMAIL || "", audienceLabel = "Todos os contatos", waves = 1, firstSendAt } = req.body || {};
+  if (!name?.trim()) return res.status(400).json({ error: "O nome da campanha é obrigatório" });
   try {
     const contactCount = number((await pool.query(`SELECT COUNT(*) FROM contacts WHERE status='valid' AND subscribed`)).rows[0].count);
-    const campaign = await pool.query(`INSERT INTO campaigns(name,subject,html_content,sender_name,sender_email,audience_label,status) VALUES($1,$2,$3,$4,$5,$6,'scheduled') RETURNING *`, [name.trim(), subject.trim(), htmlContent, senderName, senderEmail, audienceLabel]);
+    const campaign = await pool.query(`INSERT INTO campaigns(name,subject,brief,source_references,html_content,sender_name,sender_email,audience_label,status) VALUES($1,'',$2,$3,'',$4,$5,$6,'draft') RETURNING *`, [name.trim(), String(brief), JSON.stringify(Array.isArray(sourceReferences) ? sourceReferences : []), senderName, senderEmail, audienceLabel]);
     const totalWaves = Math.min(10, Math.max(1, Number(waves) || 1));
     for (let index = 0; index < totalWaves; index += 1) {
       const scheduled = firstSendAt ? new Date(new Date(firstSendAt).getTime() + index * 24 * 60 * 60 * 1000) : null;
-      await pool.query(`INSERT INTO campaign_waves(campaign_id,wave_order,scheduled_at,recipient_count) VALUES($1,$2,$3,$4)`, [campaign.rows[0].id, index + 1, scheduled, Math.ceil(contactCount / totalWaves)]);
+      await pool.query(`INSERT INTO campaign_waves(campaign_id,wave_order,scheduled_at,recipient_count,status) VALUES($1,$2,$3,$4,'draft')`, [campaign.rows[0].id, index + 1, scheduled, Math.ceil(contactCount / totalWaves)]);
     }
     res.status(201).json({ campaign: campaign.rows[0] });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/campaigns/:id/waves", requireServiceKey, requireDatabase, async (req, res, next) => {
+  try {
+    const result = await pool.query(`SELECT w.id,w.wave_order,w.scheduled_at,w.recipient_count,w.status,e.id AS email_id,e.subject,e.html_content,e.preview_text,e.status AS email_status FROM campaign_waves w LEFT JOIN campaign_emails e ON e.wave_id=w.id WHERE w.campaign_id=$1 ORDER BY w.wave_order`, [req.params.id]);
+    res.json({ waves: result.rows });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/campaigns/:id/waves/:waveId/email", requireServiceKey, requireDatabase, async (req, res, next) => {
+  const { subject, htmlContent = "", previewText = "" } = req.body || {};
+  if (!subject?.trim()) return res.status(400).json({ error: "O assunto do e-mail é obrigatório" });
+  if (/<script[\s>]/i.test(htmlContent)) return res.status(400).json({ error: "JavaScript não é permitido em e-mails. Use somente HTML e CSS compatíveis." });
+  try {
+    const wave = await pool.query(`SELECT id FROM campaign_waves WHERE id=$1 AND campaign_id=$2`, [req.params.waveId, req.params.id]);
+    if (!wave.rowCount) return res.status(404).json({ error: "Onda não encontrada" });
+    const saved = await pool.query(`INSERT INTO campaign_emails(campaign_id,wave_id,subject,html_content,preview_text,status) VALUES($1,$2,$3,$4,$5,'ready') ON CONFLICT(campaign_id,wave_id) DO UPDATE SET subject=EXCLUDED.subject,html_content=EXCLUDED.html_content,preview_text=EXCLUDED.preview_text,status='ready',updated_at=NOW() RETURNING *`, [req.params.id, req.params.waveId, subject.trim(), htmlContent, previewText]);
+    res.status(201).json({ email: saved.rows[0] });
   } catch (error) { next(error); }
 });
 
