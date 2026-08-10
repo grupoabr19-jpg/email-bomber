@@ -74,6 +74,17 @@ async function initializeDatabase() {
         status TEXT NOT NULL DEFAULT 'draft', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE(campaign_id, wave_id)
       )`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS contact_lists (
+        id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, niche TEXT NOT NULL DEFAULT '',
+        region TEXT NOT NULL DEFAULT '', qualification TEXT NOT NULL DEFAULT 'qualified',
+        source TEXT NOT NULL DEFAULT 'manual', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`);
+      await pool.query(`CREATE TABLE IF NOT EXISTS contact_list_members (
+        list_id BIGINT REFERENCES contact_lists(id) ON DELETE CASCADE,
+        contact_id BIGINT REFERENCES contacts(id) ON DELETE CASCADE,
+        PRIMARY KEY(list_id,contact_id)
+      )`);
+      await pool.query(`ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS contact_list_id BIGINT REFERENCES contact_lists(id) ON DELETE SET NULL`);
       await pool.query(
         `INSERT INTO users (email, name, role) VALUES ($1, $2, 'admin') ON CONFLICT (email) DO NOTHING`,
         [adminEmail, "Thiago Almeida"],
@@ -125,12 +136,25 @@ app.get("/api/campaigns", requireServiceKey, requireDatabase, async (_req, res, 
   try { const result = await pool.query(`SELECT c.id,c.name,c.subject,c.brief,c.source_references,c.status,c.audience_label,c.sender_name,c.sender_email,c.created_at,COALESCE(SUM(w.recipient_count),0)::int AS recipients,COUNT(w.id)::int AS waves,MIN(w.scheduled_at) AS next_send FROM campaigns c LEFT JOIN campaign_waves w ON w.campaign_id=c.id GROUP BY c.id ORDER BY c.created_at DESC`); res.json({ campaigns: result.rows }); } catch (error) { next(error); }
 });
 
+app.get("/api/contact-lists", requireServiceKey, requireDatabase, async (_req, res, next) => {
+  try { const result=await pool.query(`SELECT l.*,COUNT(m.contact_id)::int AS contacts FROM contact_lists l LEFT JOIN contact_list_members m ON m.list_id=l.id GROUP BY l.id ORDER BY l.created_at DESC`); res.json({lists:result.rows}); } catch(error){next(error);}
+});
+app.post("/api/contact-lists", requireServiceKey, requireDatabase, async (req,res,next)=>{
+  const {name,niche="",region="",qualification="qualified",source="manual",contactIds=[]}=req.body||{};
+  if(!name?.trim()) return res.status(400).json({error:"O nome da lista é obrigatório"});
+  try { const list=(await pool.query(`INSERT INTO contact_lists(name,niche,region,qualification,source) VALUES($1,$2,$3,$4,$5) RETURNING *`,[name.trim(),niche,region,qualification,source])).rows[0];
+    for(const id of Array.isArray(contactIds)?contactIds:[]) await pool.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,id]);
+    res.status(201).json({list}); }catch(error){next(error);}
+});
+
 app.post("/api/campaigns", requireServiceKey, requireDatabase, async (req, res, next) => {
-  const { name, brief = "", sourceReferences = [], senderName = "Grupo ABR", senderEmail = process.env.MICROSOFT_SENDER_EMAIL || "", audienceLabel = "Todos os contatos", waves = 1, firstSendAt } = req.body || {};
+  const { name, brief = "", sourceReferences = [], senderName = "Grupo ABR", senderEmail = process.env.MICROSOFT_SENDER_EMAIL || "", contactListId, waves = 1, firstSendAt } = req.body || {};
   if (!name?.trim()) return res.status(400).json({ error: "O nome da campanha é obrigatório" });
+  if (!contactListId) return res.status(400).json({ error: "Selecione a lista de contatos destinatária" });
   try {
-    const contactCount = number((await pool.query(`SELECT COUNT(*) FROM contacts WHERE status='valid' AND subscribed`)).rows[0].count);
-    const campaign = await pool.query(`INSERT INTO campaigns(name,subject,brief,source_references,html_content,sender_name,sender_email,audience_label,status) VALUES($1,'',$2,$3,'',$4,$5,$6,'draft') RETURNING *`, [name.trim(), String(brief), JSON.stringify(Array.isArray(sourceReferences) ? sourceReferences : []), senderName, senderEmail, audienceLabel]);
+    const list=await pool.query(`SELECT name FROM contact_lists WHERE id=$1`,[contactListId]); if(!list.rowCount) return res.status(400).json({error:"Lista não encontrada"});
+    const contactCount = number((await pool.query(`SELECT COUNT(*) FROM contact_list_members m JOIN contacts c ON c.id=m.contact_id WHERE m.list_id=$1 AND c.status='valid' AND c.subscribed`,[contactListId])).rows[0].count);
+    const campaign = await pool.query(`INSERT INTO campaigns(name,subject,brief,source_references,html_content,sender_name,sender_email,audience_label,contact_list_id,status) VALUES($1,'',$2,$3,'',$4,$5,$6,$7,'draft') RETURNING *`, [name.trim(), String(brief), JSON.stringify(Array.isArray(sourceReferences) ? sourceReferences : []), senderName, senderEmail, list.rows[0].name,contactListId]);
     const totalWaves = Math.min(10, Math.max(1, Number(waves) || 1));
     for (let index = 0; index < totalWaves; index += 1) {
       const scheduled = firstSendAt ? new Date(new Date(firstSendAt).getTime() + index * 24 * 60 * 60 * 1000) : null;
