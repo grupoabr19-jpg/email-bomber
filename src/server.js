@@ -214,7 +214,9 @@ async function initializeDatabase() {
     const adminUsers = [];
     for (const account of adminAccounts) {
       const user = (await pool.query(`INSERT INTO users(email,name,role,status) VALUES($1,$2,'admin','pending_password_setup')
-        ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,role='admin' RETURNING id`, [account.email, account.name])).rows[0];
+        ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,role='admin',
+          status=CASE WHEN users.password_hash IS NULL THEN 'pending_password_setup' ELSE 'active' END
+        RETURNING id`, [account.email, account.name])).rows[0];
       adminUsers.push(user);
     }
     const user = adminUsers[0];
