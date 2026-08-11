@@ -16,8 +16,10 @@ services:
         value: https://abr-ondas-email.grupoabr.chatgpt.site
       - key: API_ACCESS_KEY
         generateValue: true
-      - key: MICROSOFT_SENDER_EMAIL
-        value: thiago.almeida@grupoabr.com.br
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_PROSPECTION_MODEL
+        value: openai/gpt-oss-120b
       - key: MICROSOFT_TENANT_ID
         sync: false
       - key: MICROSOFT_CLIENT_ID

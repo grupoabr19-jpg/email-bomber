@@ -1,20 +1,24 @@
-# ABR Ondas API
+# Email Bomber — API
 
 Backend do sistema de campanhas de e-mail em ondas do Grupo ABR.
 
-## Implantação no Render
+## Fluxo principal
 
-O arquivo `render.yaml` cria:
+1. A Prospecção pesquisa empresas por nicho e região com Groq Browser Search.
+2. Somente contatos corporativos com página pública de origem são validados.
+3. A pesquisa encerra criando uma lista qualificada permanente.
+4. A campanha exige a seleção de uma lista destinatária.
+5. Cada onda possui assunto, conteúdo, agenda e regra de automação próprios.
 
-- um Web Service Node chamado `abr-ondas-api`;
-- um PostgreSQL chamado `abr-ondas-db`;
-- a conexão automática entre o serviço e o banco;
-- campos protegidos para as credenciais Microsoft 365.
+## Integrações
 
-No Render, use **New > Blueprint**, conecte este repositório e confirme os recursos. Os campos `MICROSOFT_TENANT_ID`, `MICROSOFT_CLIENT_ID` e `MICROSOFT_CLIENT_SECRET` serão solicitados durante a criação.
+- Neon/Postgres: persistência.
+- Groq (`openai/gpt-oss-120b` por padrão): pesquisa e qualificação.
+- Microsoft 365 OAuth/Graph: envio, assinatura e caixa de entrada por usuário.
+- SMTP: alternativa individual de envio para outros provedores.
 
-## Rotas iniciais
+## Variáveis
 
-- `GET /` — identificação do serviço;
-- `GET /health` — saúde da API e conexão com o banco;
-- `GET /api/config/status` — informa apenas quais integrações estão configuradas, sem revelar segredos.
+`DATABASE_URL`, `API_ACCESS_KEY`, `SESSION_SECRET`, `GROQ_API_KEY`,
+`GROQ_PROSPECTION_MODEL`, `FRONTEND_URL`, `MICROSOFT_TENANT_ID`,
+`MICROSOFT_CLIENT_ID` e `MICROSOFT_CLIENT_SECRET`.
