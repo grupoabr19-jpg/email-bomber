@@ -90,6 +90,29 @@ function decryptSecret(value) {
   return Buffer.concat([decipher.update(Buffer.from(encrypted, "base64url")), decipher.final()]).toString("utf8");
 }
 function cleanHtml(value) { return String(value || "").replace(/<script[\s\S]*?<\/script>/gi, ""); }
+function escapeHtmlText(value) {
+  return String(value || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");
+}
+function unsubscribeToken(contactId, campaignId) {
+  const payload = `${contactId}.${campaignId}`;
+  const signature = crypto.createHmac("sha256", process.env.SESSION_SECRET || "development-only").update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+function unsubscribeTokenIsValid(token) {
+  const [contactId, campaignId, signature] = String(token || "").split(".");
+  if (!contactId || !campaignId || !signature) return null;
+  const expected = unsubscribeToken(contactId, campaignId).split(".")[2];
+  const left = Buffer.from(signature); const right = Buffer.from(expected);
+  return left.length === right.length && crypto.timingSafeEqual(left, right) ? { contactId, campaignId } : null;
+}
+function personalizeCampaignHtml(html, contact, campaignId) {
+  const unsubscribeUrl = `${frontendUrl.replace(/\/$/,"")}/api/abr/unsubscribe?token=${encodeURIComponent(unsubscribeToken(contact.id, campaignId))}`;
+  return cleanHtml(html)
+    .replaceAll("{{nome}}", escapeHtmlText(contact.name || contact.company || "Cliente"))
+    .replaceAll("{{empresa}}", escapeHtmlText(contact.company || "sua empresa"))
+    .replaceAll("{{email}}", escapeHtmlText(contact.email))
+    .replaceAll("{{unsubscribe_url}}", unsubscribeUrl);
+}
 function normalizeContact(item) {
   const email = String(item.email || item.Email || item["E-mail"] || "").trim().toLowerCase();
   return {
@@ -195,6 +218,14 @@ async function initializeDatabase() {
       contact_id BIGINT REFERENCES contacts(id) ON DELETE SET NULL, event_type TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS campaign_deliveries (
+      id BIGSERIAL PRIMARY KEY, campaign_id BIGINT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+      wave_id BIGINT NOT NULL REFERENCES campaign_waves(id) ON DELETE CASCADE,
+      contact_id BIGINT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'pending', provider_message_id TEXT, error TEXT,
+      sent_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(wave_id, contact_id)
+    )`);
     await pool.query(`CREATE TABLE IF NOT EXISTS email_templates (
       id BIGSERIAL PRIMARY KEY, user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
       name TEXT NOT NULL, template_type TEXT NOT NULL, html_content TEXT NOT NULL,
@@ -257,6 +288,15 @@ app.get("/health", async (_req, res) => {
   catch { res.status(503).json({ status: "degraded", database: pool ? "unavailable" : "not_configured", startedAt }); }
 });
 app.use("/api", requireServiceKey, requireDatabase);
+
+app.get("/api/unsubscribe", async (req, res, next) => {
+  try {
+    const decoded = unsubscribeTokenIsValid(req.query.token);
+    if (!decoded) return res.status(400).send("Link de descadastro inválido ou expirado.");
+    await pool.query(`UPDATE contacts SET subscribed=FALSE,updated_at=NOW() WHERE id=$1`, [decoded.contactId]);
+    res.type("html").send(`<!doctype html><html lang="pt-BR"><meta charset="utf-8"><title>Descadastro confirmado</title><body style="margin:0;background:#f4f6fb;font-family:Arial,sans-serif;color:#253575"><main style="max-width:560px;margin:80px auto;padding:38px;background:#fff;border-radius:16px;text-align:center"><h1 style="margin-top:0">Descadastro confirmado</h1><p>Este endereço não receberá novos e-mails comerciais desta base.</p><p style="color:#7b8498">Grupo ABR · Seu ParceirAço</p></main></body></html>`);
+  } catch (error) { next(error); }
+});
 
 app.get("/api/auth/status", async (req, res, next) => {
   try {
@@ -446,13 +486,79 @@ app.post("/api/prospections", requireUser, async(req,res,next)=>{
   catch(error){if(run?.id)await pool.query(`UPDATE prospections SET status='failed',error=$1,completed_at=NOW() WHERE id=$2`,[error.message,run.id]).catch(()=>{});next(error);}
 });
 
+async function accountEmailSender(account, user) {
+  if (!account || account.provider === "none") throw new Error("Configure uma conta Microsoft ou SMTP antes de enviar a campanha");
+  if (account.provider === "microsoft") {
+    const ready = await refreshMicrosoftAccount(account);
+    return async ({to,subject,html}) => {
+      const response = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", {method:"POST",headers:{authorization:`Bearer ${ready.accessToken}`,"content-type":"application/json"},body:JSON.stringify({message:{subject,body:{contentType:"HTML",content:html},toRecipients:[{emailAddress:{address:to}}],replyTo:account.reply_to?[{emailAddress:{address:account.reply_to}}]:undefined},saveToSentItems:true})});
+      if (!response.ok) { const body=await response.json().catch(()=>({})); throw new Error(body.error?.message||"Falha no envio Microsoft"); }
+      return "microsoft-accepted";
+    };
+  }
+  if (account.provider === "smtp") {
+    if (!account.smtp_host || !account.smtp_user || !account.smtp_password_enc) throw new Error("Complete servidor, usuário e senha SMTP antes de enviar");
+    const transporter = nodemailer.createTransport({host:account.smtp_host,port:account.smtp_port||587,secure:Boolean(account.smtp_secure),auth:{user:account.smtp_user,pass:decryptSecret(account.smtp_password_enc)}});
+    return async ({to,subject,html}) => {
+      const result = await transporter.sendMail({from:`${account.display_name||user.name} <${account.email||account.smtp_user}>`,to,replyTo:account.reply_to||undefined,subject,html});
+      return result.messageId || "smtp-accepted";
+    };
+  }
+  throw new Error("Provedor de envio não reconhecido");
+}
+
+async function sendWaveImmediately({campaignId,waveId,user}) {
+  const bundle = (await pool.query(`SELECT w.id,w.wave_order,w.automation_mode,w.status,c.contact_list_id,c.owner_id,e.subject,e.html_content
+    FROM campaign_waves w JOIN campaigns c ON c.id=w.campaign_id JOIN campaign_emails e ON e.wave_id=w.id
+    WHERE c.id=$1 AND w.id=$2`, [campaignId,waveId])).rows[0];
+  if (!bundle) throw new Error("O e-mail da primeira onda não foi encontrado");
+  if (Number(bundle.wave_order) !== 1 || bundle.automation_mode !== "now") throw new Error("Enviar agora está disponível somente para a primeira onda");
+  const account = (await pool.query(`SELECT * FROM user_email_settings WHERE user_id=$1`, [user.id])).rows[0];
+  const sendEmail = await accountEmailSender(account,user);
+  const contacts = (await pool.query(`SELECT c.id,c.email,c.name,c.company FROM contact_list_members m JOIN contacts c ON c.id=m.contact_id
+    WHERE m.list_id=$1 AND c.status='valid' AND c.subscribed=TRUE ORDER BY c.id`, [bundle.contact_list_id])).rows;
+  if (!contacts.length) throw new Error("A lista não possui contatos válidos e autorizados para envio");
+
+  const claimed = [];
+  for (const contact of contacts) {
+    const delivery = await pool.query(`INSERT INTO campaign_deliveries(campaign_id,wave_id,contact_id,status)
+      VALUES($1,$2,$3,'sending') ON CONFLICT(wave_id,contact_id) DO UPDATE SET status='sending',error=NULL,updated_at=NOW()
+      WHERE campaign_deliveries.status='failed' OR (campaign_deliveries.status='sending' AND campaign_deliveries.updated_at<NOW()-INTERVAL '15 minutes') RETURNING id`, [campaignId,waveId,contact.id]);
+    if (delivery.rowCount) claimed.push({...contact,deliveryId:delivery.rows[0].id});
+  }
+  await pool.query(`UPDATE campaign_waves SET status='sending' WHERE id=$1 AND status NOT IN ('completed')`, [waveId]);
+  await pool.query(`UPDATE campaigns SET status='sending',updated_at=NOW() WHERE id=$1`, [campaignId]);
+
+  for (let index=0; index<claimed.length; index+=3) {
+    const batch = claimed.slice(index,index+3);
+    await Promise.all(batch.map(async contact => {
+      try {
+        const html = personalizeCampaignHtml(bundle.html_content,contact,campaignId) + cleanHtml(account.signature_html);
+        const messageId = await sendEmail({to:contact.email,subject:bundle.subject,html});
+        await pool.query(`UPDATE campaign_deliveries SET status='sent',provider_message_id=$1,error=NULL,sent_at=NOW(),updated_at=NOW() WHERE id=$2`, [messageId,contact.deliveryId]);
+        await pool.query(`INSERT INTO email_events(campaign_id,contact_id,event_type) VALUES($1,$2,'sent')`, [campaignId,contact.id]);
+      } catch (error) {
+        await pool.query(`UPDATE campaign_deliveries SET status='failed',error=$1,updated_at=NOW() WHERE id=$2`, [String(error.message||error).slice(0,1000),contact.deliveryId]);
+      }
+    }));
+  }
+
+  const stats = (await pool.query(`SELECT COUNT(*) FILTER(WHERE status='sent')::int sent,COUNT(*) FILTER(WHERE status='failed')::int failed FROM campaign_deliveries WHERE wave_id=$1`, [waveId])).rows[0];
+  const sent=number(stats.sent),failed=number(stats.failed),total=contacts.length;
+  const waveStatus=sent>=total?"completed":sent>0?"partial":"failed";
+  await pool.query(`UPDATE campaign_waves SET status=$1 WHERE id=$2`, [waveStatus,waveId]);
+  await pool.query(`UPDATE campaign_emails SET status=$1,updated_at=NOW() WHERE wave_id=$2`, [waveStatus,waveId]);
+  await pool.query(`UPDATE campaigns SET status=$1,updated_at=NOW() WHERE id=$2`, [sent>0?"active":"draft",campaignId]);
+  return {sent,failed,total,skipped:Math.max(0,total-claimed.length),status:waveStatus};
+}
+
 app.get("/api/campaigns", requireUser, async(_req,res,next)=>{try{const result=await pool.query(`SELECT c.id,c.name,c.subject,c.brief,c.source_references,c.status,c.audience_label,c.contact_list_id,c.sender_name,c.sender_email,c.created_at,COALESCE(SUM(w.recipient_count),0)::int recipients,COUNT(w.id)::int waves,MIN(w.scheduled_at) FILTER(WHERE w.scheduled_at>NOW()) next_send FROM campaigns c LEFT JOIN campaign_waves w ON w.campaign_id=c.id GROUP BY c.id ORDER BY c.created_at DESC`);res.json({campaigns:result.rows});}catch(error){next(error);}});
 app.post("/api/campaigns", requireUser, async(req,res,next)=>{
   const {name,brief="",sourceReferences=[],senderName=adminName,senderEmail="",contactListId,waves=1,firstSendAt}=req.body||{};if(!name?.trim())return res.status(400).json({error:"O nome da campanha é obrigatório"});if(!contactListId)return res.status(400).json({error:"Selecione a lista de contatos destinatária"});
   try{const list=await pool.query(`SELECT name FROM contact_lists WHERE id=$1 AND status='ready'`,[contactListId]);if(!list.rowCount)return res.status(400).json({error:"Lista não encontrada ou indisponível"});const contactCount=number((await pool.query(`SELECT COUNT(*) FROM contact_list_members m JOIN contacts c ON c.id=m.contact_id WHERE m.list_id=$1 AND c.status='valid' AND c.subscribed`,[contactListId])).rows[0].count);if(!contactCount)return res.status(400).json({error:"A lista escolhida não possui contatos válidos"});const client=await pool.connect();try{await client.query("BEGIN");const campaign=(await client.query(`INSERT INTO campaigns(name,brief,source_references,sender_name,sender_email,audience_label,contact_list_id,owner_id,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'draft') RETURNING *`,[name.trim(),String(brief),JSON.stringify(Array.isArray(sourceReferences)?sourceReferences:[]),senderName,senderEmail,list.rows[0].name,contactListId,req.user.id])).rows[0];const total=Math.min(10,Math.max(1,Number(waves)||1));for(let index=0;index<total;index++){const scheduled=firstSendAt?new Date(new Date(firstSendAt).getTime()+index*24*60*60*1000):null;await client.query(`INSERT INTO campaign_waves(campaign_id,wave_order,scheduled_at,recipient_count,status) VALUES($1,$2,$3,$4,'draft')`,[campaign.id,index+1,scheduled,contactCount]);}await client.query("COMMIT");res.status(201).json({campaign});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}}catch(error){next(error);}
 });
 app.get("/api/campaigns/:id/waves", requireUser, async(req,res,next)=>{try{const result=await pool.query(`SELECT w.id,w.wave_order,w.scheduled_at,w.recipient_count,w.automation_mode,w.delay_days,w.status,e.id email_id,e.subject,e.html_content,e.preview_text,e.editor_mode,e.layout_json,e.status email_status FROM campaign_waves w LEFT JOIN campaign_emails e ON e.wave_id=w.id WHERE w.campaign_id=$1 ORDER BY w.wave_order`,[req.params.id]);res.json({waves:result.rows});}catch(error){next(error);}});
-app.post("/api/campaigns/:id/waves/:waveId/email", requireUser, async(req,res,next)=>{const{subject,htmlContent="",previewText="",scheduledAt=null,automationMode="dated",delayDays=0,editorMode="visual",layout=[]}=req.body||{};if(!subject?.trim())return res.status(400).json({error:"O assunto é obrigatório"});if(/<script[\s>]/i.test(htmlContent))return res.status(400).json({error:"JavaScript não é permitido em e-mails"});try{const wave=await pool.query(`SELECT id FROM campaign_waves WHERE id=$1 AND campaign_id=$2`,[req.params.waveId,req.params.id]);if(!wave.rowCount)return res.status(404).json({error:"Onda não encontrada"});await pool.query(`UPDATE campaign_waves SET scheduled_at=$1,automation_mode=$2,delay_days=$3 WHERE id=$4`,[scheduledAt,automationMode,Math.max(0,Number(delayDays)||0),req.params.waveId]);const saved=await pool.query(`INSERT INTO campaign_emails(campaign_id,wave_id,subject,html_content,preview_text,editor_mode,layout_json,status) VALUES($1,$2,$3,$4,$5,$6,$7,'ready') ON CONFLICT(campaign_id,wave_id) DO UPDATE SET subject=EXCLUDED.subject,html_content=EXCLUDED.html_content,preview_text=EXCLUDED.preview_text,editor_mode=EXCLUDED.editor_mode,layout_json=EXCLUDED.layout_json,status='ready',updated_at=NOW() RETURNING *`,[req.params.id,req.params.waveId,subject.trim(),htmlContent,previewText,editorMode,JSON.stringify(Array.isArray(layout)?layout:[])]);await pool.query(`UPDATE campaigns SET subject=$1,updated_at=NOW() WHERE id=$2`,[subject.trim(),req.params.id]);res.status(201).json({email:saved.rows[0]});}catch(error){next(error);}});
+app.post("/api/campaigns/:id/waves/:waveId/email", requireUser, async(req,res,next)=>{const{subject,htmlContent="",previewText="",scheduledAt=null,automationMode="dated",delayDays=0,editorMode="visual",layout=[],sendNow=false}=req.body||{};if(!subject?.trim())return res.status(400).json({error:"O assunto é obrigatório"});if(/<script[\s>]/i.test(htmlContent))return res.status(400).json({error:"JavaScript não é permitido em e-mails"});if(!["now","dated","unopened","opened_no_click","no_reply"].includes(automationMode))return res.status(400).json({error:"Regra de envio inválida"});try{const wave=await pool.query(`SELECT id,wave_order,status FROM campaign_waves WHERE id=$1 AND campaign_id=$2`,[req.params.waveId,req.params.id]);if(!wave.rowCount)return res.status(404).json({error:"Onda não encontrada"});if(automationMode==="now"&&Number(wave.rows[0].wave_order)!==1)return res.status(400).json({error:"Enviar agora está disponível somente para a primeira onda"});if(sendNow&&automationMode!=="now")return res.status(400).json({error:"Confirme a regra Enviar agora antes do disparo"});await pool.query(`UPDATE campaign_waves SET scheduled_at=$1,automation_mode=$2,delay_days=$3 WHERE id=$4`,[automationMode==="dated"?scheduledAt:null,automationMode,Math.max(0,Number(delayDays)||0),req.params.waveId]);const saved=await pool.query(`INSERT INTO campaign_emails(campaign_id,wave_id,subject,html_content,preview_text,editor_mode,layout_json,status) VALUES($1,$2,$3,$4,$5,$6,$7,'ready') ON CONFLICT(campaign_id,wave_id) DO UPDATE SET subject=EXCLUDED.subject,html_content=EXCLUDED.html_content,preview_text=EXCLUDED.preview_text,editor_mode=EXCLUDED.editor_mode,layout_json=EXCLUDED.layout_json,status=CASE WHEN campaign_emails.status IN ('completed','partial') THEN campaign_emails.status ELSE 'ready' END,updated_at=NOW() RETURNING *`,[req.params.id,req.params.waveId,subject.trim(),htmlContent,previewText,editorMode,JSON.stringify(Array.isArray(layout)?layout:[])]);await pool.query(`UPDATE campaigns SET subject=$1,updated_at=NOW() WHERE id=$2`,[subject.trim(),req.params.id]);const delivery=sendNow?await sendWaveImmediately({campaignId:req.params.id,waveId:req.params.waveId,user:req.user}):null;res.status(201).json({email:saved.rows[0],delivery});}catch(error){next(error);}});
 app.post("/api/campaigns/:id/duplicate", requireUser, async(req,res,next)=>{try{const original=(await pool.query(`SELECT * FROM campaigns WHERE id=$1`,[req.params.id])).rows[0];if(!original)return res.status(404).json({error:"Campanha não encontrada"});const client=await pool.connect();try{await client.query("BEGIN");const copy=(await client.query(`INSERT INTO campaigns(name,subject,html_content,brief,source_references,sender_name,sender_email,audience_label,contact_list_id,owner_id,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'draft') RETURNING *`,[`${original.name} — cópia`,original.subject,original.html_content,original.brief,original.source_references,original.sender_name,original.sender_email,original.audience_label,original.contact_list_id,req.user.id])).rows[0];const waves=(await client.query(`SELECT * FROM campaign_waves WHERE campaign_id=$1 ORDER BY wave_order`,[original.id])).rows;for(const wave of waves){const newWave=(await client.query(`INSERT INTO campaign_waves(campaign_id,wave_order,scheduled_at,recipient_count,automation_mode,delay_days,status) VALUES($1,$2,NULL,$3,$4,$5,'draft') RETURNING id`,[copy.id,wave.wave_order,wave.recipient_count,wave.automation_mode,wave.delay_days])).rows[0];const email=(await client.query(`SELECT * FROM campaign_emails WHERE wave_id=$1`,[wave.id])).rows[0];if(email)await client.query(`INSERT INTO campaign_emails(campaign_id,wave_id,subject,html_content,preview_text,editor_mode,layout_json,status) VALUES($1,$2,$3,$4,$5,$6,$7,'draft')`,[copy.id,newWave.id,email.subject,email.html_content,email.preview_text,email.editor_mode,email.layout_json]);}await client.query("COMMIT");res.status(201).json({campaign:copy});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}}catch(error){next(error);}});
 app.delete("/api/campaigns/:id", requireUser, async(req,res,next)=>{try{await pool.query(`DELETE FROM campaigns WHERE id=$1`,[req.params.id]);res.json({ok:true});}catch(error){next(error);}});
 
@@ -473,7 +579,7 @@ app.post("/api/microsoft/connect", requireUser, async(req,res,next)=>{try{if(!pr
 app.get("/api/microsoft/callback", async(req,res)=>{const code=String(req.query.code||""),state=String(req.query.state||"");try{const saved=(await pool.query(`DELETE FROM oauth_states WHERE state_hash=$1 AND expires_at>NOW() RETURNING user_id`,[tokenHash(state)])).rows[0];if(!saved||!code)throw new Error("Autorização expirada ou inválida");const response=await fetch(`https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`,{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams({client_id:process.env.MICROSOFT_CLIENT_ID||"",client_secret:process.env.MICROSOFT_CLIENT_SECRET||"",code,redirect_uri:microsoftRedirectUri(),grant_type:"authorization_code",scope:"offline_access User.Read Mail.Read Mail.Send"})});const token=await response.json();if(!response.ok)throw new Error(token.error_description||"Falha ao conectar Microsoft");const profileResponse=await fetch("https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName",{headers:{authorization:`Bearer ${token.access_token}`}});const profile=await profileResponse.json();await pool.query(`INSERT INTO user_email_settings(user_id,provider,email,display_name,microsoft_access_token_enc,microsoft_refresh_token_enc,microsoft_expires_at,connected_at,updated_at) VALUES($1,'microsoft',$2,$3,$4,$5,$6,NOW(),NOW()) ON CONFLICT(user_id) DO UPDATE SET provider='microsoft',email=EXCLUDED.email,display_name=EXCLUDED.display_name,microsoft_access_token_enc=EXCLUDED.microsoft_access_token_enc,microsoft_refresh_token_enc=EXCLUDED.microsoft_refresh_token_enc,microsoft_expires_at=EXCLUDED.microsoft_expires_at,connected_at=NOW(),updated_at=NOW()`,[saved.user_id,profile.mail||profile.userPrincipalName,profile.displayName,encryptSecret(token.access_token),encryptSecret(token.refresh_token),new Date(Date.now()+Number(token.expires_in||3600)*1000)]);res.redirect(`${frontendUrl}/?microsoft=connected`);}catch(error){res.redirect(`${frontendUrl}/?microsoft=error&detail=${encodeURIComponent(error.message)}`);}});
 app.post("/api/microsoft/disconnect", requireUser, async(req,res,next)=>{try{await pool.query(`UPDATE user_email_settings SET provider='none',microsoft_access_token_enc=NULL,microsoft_refresh_token_enc=NULL,microsoft_expires_at=NULL,connected_at=NULL WHERE user_id=$1`,[req.user.id]);res.json({ok:true});}catch(error){next(error);}});
 app.get("/api/inbox", requireUser, async(req,res,next)=>{try{const account=(await pool.query(`SELECT * FROM user_email_settings WHERE user_id=$1`,[req.user.id])).rows[0];if(!account||account.provider!=="microsoft")return res.status(409).json({error:"Conecte uma conta Microsoft para receber as respostas no sistema"});const ready=await refreshMicrosoftAccount(account);const response=await fetch("https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages?$top=50&$orderby=receivedDateTime%20desc&$select=id,subject,from,receivedDateTime,isRead,bodyPreview,webLink",{headers:{authorization:`Bearer ${ready.accessToken}`}});const body=await response.json();if(!response.ok)throw new Error(body.error?.message||"Não foi possível sincronizar a caixa de entrada");res.json({messages:(body.value||[]).map((item)=>({id:item.id,subject:item.subject,fromName:item.from?.emailAddress?.name,fromEmail:item.from?.emailAddress?.address,receivedAt:item.receivedDateTime,isRead:item.isRead,preview:item.bodyPreview,webLink:item.webLink}))});}catch(error){next(error);}});
-app.post("/api/email/test", requireUser, async(req,res,next)=>{try{const account=(await pool.query(`SELECT * FROM user_email_settings WHERE user_id=$1`,[req.user.id])).rows[0];if(!account)return res.status(409).json({error:"Configure sua conta de envio"});const to=String(req.body?.to||account.email||req.user.email),subject=String(req.body?.subject||"Teste do Email Bomber"),content=cleanHtml(req.body?.htmlContent||"<p>Seu e-mail está configurado corretamente.</p>")+cleanHtml(account.signature_html);if(account.provider==="microsoft"){const ready=await refreshMicrosoftAccount(account);const response=await fetch("https://graph.microsoft.com/v1.0/me/sendMail",{method:"POST",headers:{authorization:`Bearer ${ready.accessToken}`,"content-type":"application/json"},body:JSON.stringify({message:{subject,body:{contentType:"HTML",content},toRecipients:[{emailAddress:{address:to}}]},saveToSentItems:true})});if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error?.message||"Falha no envio Microsoft");}}else if(account.provider==="smtp"){const transporter=nodemailer.createTransport({host:account.smtp_host,port:account.smtp_port||587,secure:Boolean(account.smtp_secure),auth:{user:account.smtp_user,pass:decryptSecret(account.smtp_password_enc)}});await transporter.sendMail({from:`${account.display_name||req.user.name} <${account.email||account.smtp_user}>`,to,replyTo:account.reply_to||undefined,subject,html:content});}else return res.status(409).json({error:"Escolha Microsoft ou SMTP nas configurações"});res.json({ok:true,to});}catch(error){next(error);}});
+app.post("/api/email/test", requireUser, async(req,res,next)=>{try{const account=(await pool.query(`SELECT * FROM user_email_settings WHERE user_id=$1`,[req.user.id])).rows[0];if(!account)return res.status(409).json({error:"Configure sua conta de envio"});const to=String(req.body?.to||account.email||req.user.email),subject=String(req.body?.subject||"Teste do Email Bomber"),content=cleanHtml(req.body?.htmlContent||"<p>Seu e-mail está configurado corretamente.</p>")+cleanHtml(account.signature_html);const sendEmail=await accountEmailSender(account,req.user);await sendEmail({to,subject,html:content});res.json({ok:true,to});}catch(error){next(error);}});
 
 app.get("/api/admins", requireUser, async(_req,res,next)=>{try{const result=await pool.query(`SELECT email,name,role,status,created_at FROM users WHERE role='admin' ORDER BY created_at`);res.json({admins:result.rows});}catch(error){next(error);}});
 app.use((error,_req,res,_next)=>{console.error(error);res.status(500).json({error:error.message||"Erro interno"});});
