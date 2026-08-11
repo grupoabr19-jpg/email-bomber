@@ -11,8 +11,23 @@ import pg from "pg";
 const app = express();
 const port = Number(process.env.PORT || 3000);
 const startedAt = new Date().toISOString();
-const adminEmail = "pietra.leite@grupoabr.com.br";
-const adminName = "Pietra Leite";
+function configuredAdminAccounts() {
+  try {
+    const parsed = JSON.parse(process.env.ADMIN_ACCOUNTS_JSON || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((account) => {
+      const email = String(account?.email || "").trim().toLowerCase();
+      return { email, name: String(account?.name || email.split("@")[0] || "Administrador").trim() };
+    }).filter((account) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(account.email));
+  } catch {
+    console.error("ADMIN_ACCOUNTS_JSON está inválida");
+    return [];
+  }
+}
+const adminAccounts = configuredAdminAccounts();
+const authorizedAdminEmails = new Set(adminAccounts.map((account) => account.email));
+const adminEmail = adminAccounts[0]?.email || "";
+const adminName = adminAccounts[0]?.name || "Administrador ABR";
 const frontendUrl = process.env.FRONTEND_URL || "https://abr-ondas-email.grupoabr.chatgpt.site";
 const sessionCookie = "abr_session";
 const freeEmailDomains = new Set(["gmail.com","hotmail.com","outlook.com","yahoo.com","icloud.com","live.com","bol.com.br","uol.com.br","terra.com.br"]);
@@ -196,15 +211,19 @@ async function initializeDatabase() {
       state_hash TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
-    const user = (await pool.query(`INSERT INTO users(email,name,role,status) VALUES($1,$2,'admin','pending_password_setup')
-      ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,role='admin' RETURNING id`, [adminEmail, adminName])).rows[0];
-    await pool.query(`UPDATE users SET status='disabled' WHERE email='thiago.almeida@grupoabr.com.br' AND password_hash IS NULL`);
+    const adminUsers = [];
+    for (const account of adminAccounts) {
+      const user = (await pool.query(`INSERT INTO users(email,name,role,status) VALUES($1,$2,'admin','pending_password_setup')
+        ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,role='admin' RETURNING id`, [account.email, account.name])).rows[0];
+      adminUsers.push(user);
+    }
+    const user = adminUsers[0];
     const defaults = [
       ["Header ABR", "header", `<header style="padding:24px 32px;background:#253575;text-align:center"><strong style="color:#fff;font:700 20px Arial">GRUPO ABR</strong></header>`],
       ["Oferta comercial", "body", `<section style="padding:34px 32px;background:#fff;color:#253575;font-family:Arial"><h1 style="margin:0 0 14px">Uma condição especial para você</h1><p style="line-height:1.6">Apresente aqui a oportunidade e o valor para o cliente.</p></section>`],
       ["Footer institucional", "footer", `<footer style="padding:22px 32px;background:#eef1f7;color:#5d6780;font:12px/1.5 Arial;text-align:center">Grupo ABR · Seu ParceirAço<br><a href="{{unsubscribe_url}}">Descadastrar</a></footer>`]
     ];
-    for (const [name, type, html] of defaults) await pool.query(`INSERT INTO email_templates(user_id,name,template_type,html_content)
+    if (user) for (const [name, type, html] of defaults) await pool.query(`INSERT INTO email_templates(user_id,name,template_type,html_content)
       SELECT $1,$2,$3,$4 WHERE NOT EXISTS(SELECT 1 FROM email_templates WHERE user_id=$1 AND name=$2)`, [user.id, name, type, html]);
   })().catch((error) => { schemaPromise = undefined; throw error; });
   return schemaPromise;
@@ -239,16 +258,15 @@ app.use("/api", requireServiceKey, requireDatabase);
 
 app.get("/api/auth/status", async (req, res, next) => {
   try {
-    const setup = (await pool.query(`SELECT status FROM users WHERE email=$1`, [adminEmail])).rows[0];
     const token = decodeURIComponent(cookieValue(req, sessionCookie));
-    if (!token) return res.json({ authenticated:false, allowedEmail:adminEmail, needsSetup:setup?.status === "pending_password_setup" });
+    if (!token) return res.json({ authenticated:false, allowedEmail:adminEmail, needsSetup:false });
     const result = await pool.query(`SELECT u.id,u.email,u.name,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>NOW() AND u.status='active'`, [tokenHash(token)]);
-    res.json({ authenticated:Boolean(result.rowCount), user:result.rows[0] || null, allowedEmail:adminEmail, needsSetup:setup?.status === "pending_password_setup" });
+    res.json({ authenticated:Boolean(result.rowCount), user:result.rows[0] || null, allowedEmail:adminEmail, needsSetup:false });
   } catch (error) { next(error); }
 });
 app.post("/api/auth/setup", async (req, res, next) => {
   const email = String(req.body?.email || "").trim().toLowerCase(); const password = String(req.body?.password || "");
-  if (email !== adminEmail) return res.status(403).json({ error: "Usuária não autorizada" });
+  if (!authorizedAdminEmails.has(email)) return res.status(403).json({ error: "Usuário não autorizado" });
   if (password.length < 8) return res.status(400).json({ error: "A senha deve ter pelo menos 8 caracteres" });
   try {
     const result = await pool.query(`UPDATE users SET password_hash=$1,status='active' WHERE email=$2 AND status='pending_password_setup' RETURNING id,email,name,role`, [passwordHash(password), email]);
@@ -260,6 +278,7 @@ app.post("/api/auth/login", async (req, res, next) => {
   const email = String(req.body?.email || "").trim().toLowerCase(); const password = String(req.body?.password || "");
   try {
     const result = await pool.query(`SELECT id,email,name,role,password_hash,status FROM users WHERE email=$1`, [email]); const user=result.rows[0];
+    if (user?.status === "pending_password_setup") return res.status(409).json({ error: "Crie a senha inicial desta conta", code: "PASSWORD_SETUP_REQUIRED" });
     if (!user || user.status !== "active" || !passwordMatches(password, user.password_hash)) return res.status(401).json({ error: "E-mail ou senha incorretos" });
     await createSession(user.id, res); delete user.password_hash; delete user.status; res.json({ user });
   } catch (error) { next(error); }
@@ -271,7 +290,7 @@ app.post("/api/auth/logout", requireUser, async (req, res, next) => {
 app.get("/api/config/status", requireUser, async (req, res, next) => {
   try {
     const account=(await pool.query(`SELECT provider,email,connected_at FROM user_email_settings WHERE user_id=$1`,[req.user.id])).rows[0];
-    res.json({ database:true, groq:Boolean(process.env.GROQ_API_KEY), groqModel:process.env.GROQ_PROSPECTION_MODEL||"openai/gpt-oss-120b", microsoft:Boolean(process.env.MICROSOFT_TENANT_ID&&process.env.MICROSOFT_CLIENT_ID&&process.env.MICROSOFT_CLIENT_SECRET), account:account||null });
+    res.json({ database:true, groq:Boolean(process.env.GROQ_API_KEY), groqModel:process.env.GROQ_PROSPECTION_MODEL||"openai/gpt-oss-120b", gemini:Boolean(process.env.GEMINI_API_KEY), geminiModel:process.env.GEMINI_PROSPECTION_MODEL||"gemini-3.6-flash", microsoft:Boolean(process.env.MICROSOFT_TENANT_ID&&process.env.MICROSOFT_CLIENT_ID&&process.env.MICROSOFT_CLIENT_SECRET), account:account||null });
   } catch(error){next(error);}
 });
 app.get("/api/dashboard", requireUser, async (_req, res, next) => {
@@ -309,12 +328,12 @@ app.post("/api/contact-lists", requireUser, async(req,res,next)=>{
 });
 app.delete("/api/contact-lists/:id", requireUser, async(req,res,next)=>{try{const used=await pool.query(`SELECT 1 FROM campaigns WHERE contact_list_id=$1 LIMIT 1`,[req.params.id]);if(used.rowCount)return res.status(409).json({error:"Esta lista está vinculada a uma campanha"});await pool.query(`DELETE FROM contact_lists WHERE id=$1`,[req.params.id]);res.json({ok:true});}catch(error){next(error);}});
 
-function extractGroqJson(text){
+function extractResearchJson(text,provider="A IA"){
   const cleaned=String(text||"").replace(/```(?:json)?/gi,"").replace(/```/g,"").trim();
   const objectStart=cleaned.indexOf("{"); const objectEnd=cleaned.lastIndexOf("}");
   const arrayStart=cleaned.indexOf("["); const arrayEnd=cleaned.lastIndexOf("]");
   for(const candidate of [objectStart>=0&&objectEnd>objectStart?cleaned.slice(objectStart,objectEnd+1):"",arrayStart>=0&&arrayEnd>arrayStart?cleaned.slice(arrayStart,arrayEnd+1):""]){if(!candidate)continue;try{return JSON.parse(candidate);}catch{}}
-  throw new Error("A Groq respondeu, mas não retornou uma lista estruturada válida");
+  throw new Error(`${provider} respondeu, mas não retornou uma lista estruturada válida`);
 }
 function privateNetworkAddress(address){
   if(net.isIPv4(address)){
@@ -357,30 +376,71 @@ async function sourceContainsEmail(sourceUrl,email){
     return false;
   }catch{return false;}finally{clearTimeout(timeout);}
 }
-async function runGroqProspection({niche,region,quantity,criteria}){
-  if(!process.env.GROQ_API_KEY)throw new Error("GROQ_API_KEY não configurada");
-  const model=process.env.GROQ_PROSPECTION_MODEL||"openai/gpt-oss-120b";
-  const prompt=`Você é um pesquisador comercial B2B do Grupo ABR, distribuidor de aço. Pesquise empresas reais do nicho "${niche}" na região "${region}". Encontre até ${quantity} empresas. Critérios adicionais: ${criteria||"aderência comercial a aços longos, planos, telhas, perfis, chapas ou estruturas metálicas"}.
+function prospectionPrompt({niche,region,quantity,criteria,excludedEmails=[]}){
+  const exclusions=excludedEmails.length?` Não repita estes e-mails já encontrados: ${excludedEmails.join(", ")}.`:"";
+  return `Você é um pesquisador comercial B2B do Grupo ABR, distribuidor de aço. Pesquise empresas reais do nicho "${niche}" na região "${region}". Encontre até ${quantity} empresas diferentes. Critérios adicionais: ${criteria||"aderência comercial a aços longos, planos, telhas, perfis, chapas ou estruturas metálicas"}.${exclusions}
 Use apenas fontes públicas. O e-mail precisa ser corporativo, estar literalmente publicado na URL de origem informada e não pode ser Gmail, Hotmail, Outlook, Yahoo ou outro provedor gratuito. Não invente empresa, site, e-mail ou fonte. Qualifique o potencial de 0 a 100 e sugira um argumento comercial específico.
 Responda somente com JSON válido, sem markdown, no formato {"list_name":"...","contacts":[{"company":"...","email":"...","name":"...","segment":"...","city":"...","region":"...","website":"https://...","source_url":"https://pagina-exata-onde-o-email-aparece","qualification_score":0,"qualification_label":"alto|medio|baixo","qualification_reason":"...","suggested_angle":"..."}]}. Se não encontrar um e-mail verificável, não inclua a empresa.`;
-  const response=await fetch("https://api.groq.com/openai/v1/chat/completions",{method:"POST",headers:{authorization:`Bearer ${process.env.GROQ_API_KEY}`,"content-type":"application/json"},body:JSON.stringify({messages:[{role:"user",content:prompt}],model,temperature:0.2,max_completion_tokens:10000,top_p:1,stream:false,reasoning_effort:"low",tool_choice:"required",tools:[{type:"browser_search"}]})});
-  const body=await response.json().catch(()=>({})); if(!response.ok)throw new Error(body.error?.message||`Falha na Groq (${response.status})`);
-  const parsed=extractGroqJson(body.choices?.[0]?.message?.content); const raw=Array.isArray(parsed)?parsed:(parsed.contacts||parsed.prospects||[]);
-  const normalized=raw.map(normalizeContact).filter((item)=>item.company&&corporateEmailIsValid(item.email)&&/^https?:\/\//i.test(item.sourceUrl));
-  const unique=[...new Map(normalized.map((item)=>[item.email,item])).values()].slice(0,quantity);
+}
+function parsedResearchPayload(parsed,quantity){
+  const raw=Array.isArray(parsed)?parsed:(parsed.contacts||parsed.prospects||[]);
+  return {listName:String(parsed.list_name||"").trim(),contacts:raw.map(normalizeContact).filter((item)=>item.company&&corporateEmailIsValid(item.email)&&/^https?:\/\//i.test(item.sourceUrl)).slice(0,quantity)};
+}
+async function runGroqBatch({niche,region,quantity,criteria,excludedEmails}){
+  if(!process.env.GROQ_API_KEY)throw new Error("GROQ_API_KEY não configurada");
+  const model=process.env.GROQ_PROSPECTION_MODEL||"openai/gpt-oss-120b";
+  const prompt=prospectionPrompt({niche,region,quantity,criteria,excludedEmails});
+  const response=await fetch("https://api.groq.com/openai/v1/chat/completions",{method:"POST",headers:{authorization:`Bearer ${process.env.GROQ_API_KEY}`,"content-type":"application/json"},body:JSON.stringify({messages:[{role:"user",content:prompt}],model,temperature:0.2,max_completion_tokens:1800,top_p:1,stream:false,reasoning_effort:"low",tool_choice:"required",tools:[{type:"browser_search"}]})});
+  const body=await response.json().catch(()=>({})); if(!response.ok){const error=new Error(body.error?.message||`Falha na Groq (${response.status})`);error.status=response.status;throw error;}
+  const parsed=extractResearchJson(body.choices?.[0]?.message?.content,"A Groq");
+  return {provider:"groq",model,...parsedResearchPayload(parsed,quantity)};
+}
+async function runGeminiBatch({niche,region,quantity,criteria,excludedEmails}){
+  if(!process.env.GEMINI_API_KEY)throw new Error("GEMINI_API_KEY não configurada");
+  const model=process.env.GEMINI_PROSPECTION_MODEL||"gemini-3.6-flash";
+  const prompt=prospectionPrompt({niche,region,quantity,criteria,excludedEmails});
+  const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:"POST",headers:{"x-goog-api-key":process.env.GEMINI_API_KEY,"content-type":"application/json"},body:JSON.stringify({contents:[{parts:[{text:prompt}]}],tools:[{google_search:{}}],generationConfig:{maxOutputTokens:3000}})});
+  const body=await response.json().catch(()=>({})); if(!response.ok){const error=new Error(body.error?.message||`Falha no Gemini (${response.status})`);error.status=response.status;throw error;}
+  const text=(body.candidates?.[0]?.content?.parts||[]).map((part)=>part.text||"").join("\n");
+  const parsed=extractResearchJson(text,"O Gemini");
+  return {provider:"gemini",model,...parsedResearchPayload(parsed,quantity)};
+}
+async function verifyResearchContacts(items,quantity){
+  const unique=[...new Map(items.map((item)=>[item.email,item])).values()].slice(0,quantity);
   const verified=[];
   for(let index=0;index<unique.length;index+=5){
     const group=unique.slice(index,index+5);
     const checks=await Promise.all(group.map(async item=>({item,valid:await sourceContainsEmail(item.sourceUrl,item.email)})));
     verified.push(...checks.filter(check=>check.valid).map(check=>check.item));
   }
-  return {model,listName:String(parsed.list_name||`${niche} · ${region}`).trim(),contacts:verified};
+  return verified;
+}
+async function runAiProspection({niche,region,quantity,criteria}){
+  const providers=[];
+  if(process.env.GROQ_API_KEY)providers.push({name:"groq",run:runGroqBatch});
+  if(process.env.GEMINI_API_KEY)providers.push({name:"gemini",run:runGeminiBatch});
+  if(!providers.length)throw new Error("Configure GROQ_API_KEY ou GEMINI_API_KEY para executar a Prospecção");
+  const contacts=new Map(),models=new Set(),usedProviders=new Set(),failures=[];let listName="";
+  const batchSize=5,totalBatches=Math.ceil(quantity/batchSize);
+  for(let batchIndex=0;batchIndex<totalBatches&&contacts.size<quantity;batchIndex++){
+    const ordered=providers.map((_,offset)=>providers[(batchIndex+offset)%providers.length]);let result=null;
+    for(const provider of ordered){
+      try{result=await provider.run({niche,region,quantity:Math.min(batchSize,quantity-contacts.size),criteria,excludedEmails:[...contacts.keys()]});break;}
+      catch(error){failures.push(`${provider.name}: ${error.message}`);}
+    }
+    if(!result){if(!contacts.size)throw new Error(`A pesquisa falhou nos provedores configurados. ${failures.slice(-providers.length).join(" | ")}`);break;}
+    if(result.listName&&!listName)listName=result.listName;models.add(result.model);usedProviders.add(result.provider);
+    for(const item of result.contacts)if(!contacts.has(item.email))contacts.set(item.email,item);
+  }
+  const verified=await verifyResearchContacts([...contacts.values()],quantity);
+  return {provider:[...usedProviders].join("+"),model:[...models].join(" + "),listName:listName||`${niche} · ${region}`,contacts:verified};
 }
 app.get("/api/prospections", requireUser, async(_req,res,next)=>{try{const result=await pool.query(`SELECT p.*,l.name list_name FROM prospections p LEFT JOIN contact_lists l ON l.id=p.list_id ORDER BY p.created_at DESC LIMIT 50`);res.json({prospections:result.rows});}catch(error){next(error);}});
 app.post("/api/prospections", requireUser, async(req,res,next)=>{
-  const niche=String(req.body?.niche||"").trim(),region=String(req.body?.region||"").trim(),criteria=String(req.body?.criteria||"").trim(),requestedName=String(req.body?.listName||"").trim();const quantity=Math.max(1,Math.min(50,Number(req.body?.quantity)||10));
+  const niche=String(req.body?.niche||"").trim(),region=String(req.body?.region||"").trim(),criteria=String(req.body?.criteria||"").trim(),requestedName=String(req.body?.listName||"").trim();const quantity=Math.max(1,Math.min(20,Number(req.body?.quantity)||10));
   if(!niche||!region)return res.status(400).json({error:"Informe o nicho e a região"});
-  let run; try{run=(await pool.query(`INSERT INTO prospections(niche,region,criteria,requested_count,model,created_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[niche,region,criteria,quantity,process.env.GROQ_PROSPECTION_MODEL||"openai/gpt-oss-120b",req.user.id])).rows[0]; const research=await runGroqProspection({niche,region,quantity,criteria}); if(!research.contacts.length)throw new Error("A pesquisa não encontrou e-mails corporativos que também aparecessem na página pública informada"); const client=await pool.connect(); try{await client.query("BEGIN"); const list=(await client.query(`INSERT INTO contact_lists(name,niche,region,qualification,source,criteria,created_by) VALUES($1,$2,$3,'qualified','groq_browser_search',$4,$5) RETURNING *`,[requestedName||research.listName,niche,region,criteria,req.user.id])).rows[0]; for(const item of research.contacts){const contact=(await client.query(`INSERT INTO contacts(email,name,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle,status,subscribed) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'valid',TRUE) ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,company=EXCLUDED.company,segment=EXCLUDED.segment,city=EXCLUDED.city,region=EXCLUDED.region,website=EXCLUDED.website,source_url=EXCLUDED.source_url,qualification_score=EXCLUDED.qualification_score,qualification_label=EXCLUDED.qualification_label,qualification_reason=EXCLUDED.qualification_reason,suggested_angle=EXCLUDED.suggested_angle,status='valid',updated_at=NOW() RETURNING id`,[item.email,item.name,item.company,item.segment||niche,item.city,item.region||region,item.website,item.sourceUrl,item.qualificationScore,item.qualificationLabel,item.qualificationReason,item.suggestedAngle])).rows[0];await client.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,contact.id]);} await client.query(`UPDATE prospections SET list_id=$1,found_count=$2,status='completed',model=$3,completed_at=NOW() WHERE id=$4`,[list.id,research.contacts.length,research.model,run.id]);await client.query("COMMIT");res.status(201).json({prospection:{...run,status:"completed",found_count:research.contacts.length,list_id:list.id},list,contacts:research.contacts});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}}
+  const configuredModel=[process.env.GROQ_API_KEY&&(process.env.GROQ_PROSPECTION_MODEL||"openai/gpt-oss-120b"),process.env.GEMINI_API_KEY&&(process.env.GEMINI_PROSPECTION_MODEL||"gemini-3.6-flash")].filter(Boolean).join(" + ");
+  let run; try{run=(await pool.query(`INSERT INTO prospections(niche,region,criteria,requested_count,provider,model,created_by) VALUES($1,$2,$3,$4,'ai_fallback',$5,$6) RETURNING *`,[niche,region,criteria,quantity,configuredModel,req.user.id])).rows[0]; const research=await runAiProspection({niche,region,quantity,criteria}); if(!research.contacts.length)throw new Error("A pesquisa não encontrou e-mails corporativos que também aparecessem na página pública informada"); const client=await pool.connect(); try{await client.query("BEGIN"); const list=(await client.query(`INSERT INTO contact_lists(name,niche,region,qualification,source,criteria,created_by) VALUES($1,$2,$3,'qualified','ai_web_search',$4,$5) RETURNING *`,[requestedName||research.listName,niche,region,criteria,req.user.id])).rows[0]; for(const item of research.contacts){const contact=(await client.query(`INSERT INTO contacts(email,name,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle,status,subscribed) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'valid',TRUE) ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,company=EXCLUDED.company,segment=EXCLUDED.segment,city=EXCLUDED.city,region=EXCLUDED.region,website=EXCLUDED.website,source_url=EXCLUDED.source_url,qualification_score=EXCLUDED.qualification_score,qualification_label=EXCLUDED.qualification_label,qualification_reason=EXCLUDED.qualification_reason,suggested_angle=EXCLUDED.suggested_angle,status='valid',updated_at=NOW() RETURNING id`,[item.email,item.name,item.company,item.segment||niche,item.city,item.region||region,item.website,item.sourceUrl,item.qualificationScore,item.qualificationLabel,item.qualificationReason,item.suggestedAngle])).rows[0];await client.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,contact.id]);} await client.query(`UPDATE prospections SET list_id=$1,found_count=$2,status='completed',provider=$3,model=$4,completed_at=NOW() WHERE id=$5`,[list.id,research.contacts.length,research.provider,research.model,run.id]);await client.query("COMMIT");res.status(201).json({prospection:{...run,status:"completed",found_count:research.contacts.length,list_id:list.id,provider:research.provider,model:research.model},list,contacts:research.contacts});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}}
   catch(error){if(run?.id)await pool.query(`UPDATE prospections SET status='failed',error=$1,completed_at=NOW() WHERE id=$2`,[error.message,run.id]).catch(()=>{});next(error);}
 });
 

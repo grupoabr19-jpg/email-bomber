@@ -16,10 +16,16 @@ services:
         value: https://abr-ondas-email.grupoabr.chatgpt.site
       - key: API_ACCESS_KEY
         generateValue: true
+      - key: ADMIN_ACCOUNTS_JSON
+        sync: false
       - key: GROQ_API_KEY
         sync: false
       - key: GROQ_PROSPECTION_MODEL
         value: openai/gpt-oss-120b
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_PROSPECTION_MODEL
+        value: gemini-3.6-flash
       - key: MICROSOFT_TENANT_ID
         sync: false
       - key: MICROSOFT_CLIENT_ID
