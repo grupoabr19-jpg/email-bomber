@@ -134,6 +134,15 @@ function corporateEmailIsValid(email) {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return false;
   return !freeEmailDomains.has(email.split("@")[1]);
 }
+function emailIsValid(email) { return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(email || "")); }
+function wait(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+function retryDelayMs(error) {
+  if (Number(error?.status) !== 429) return 0;
+  const explicit = Number(error?.retryAfterMs || 0);
+  if (explicit > 0) return Math.min(30000, Math.max(1000, explicit));
+  const match = String(error?.message || "").match(/(?:try again in|tente novamente em)\s*([\d.]+)s/i);
+  return Math.min(30000, Math.max(1000, Math.ceil(Number(match?.[1] || 20) * 1000)));
+}
 
 let schemaPromise;
 async function initializeDatabase() {
@@ -357,6 +366,44 @@ app.post("/api/contacts/import", requireUser, async (req,res,next)=>{
   if(!items.length) return res.status(400).json({error:"Nenhum contato válido encontrado"});
   try { let imported=0; for(const item of items.slice(0,10000)){const result=await pool.query(`INSERT INTO contacts(email,name,company,segment,city,region,website,source_url) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,company=EXCLUDED.company,segment=EXCLUDED.segment,city=EXCLUDED.city,region=EXCLUDED.region,website=EXCLUDED.website,source_url=EXCLUDED.source_url,updated_at=NOW()`,[item.email,item.name,item.company,item.segment,item.city,item.region,item.website,item.sourceUrl]); if(result.rowCount) imported++;} res.status(201).json({imported,received:items.length}); }catch(error){next(error);}
 });
+app.post("/api/contacts/manual", requireUser, async(req,res,next)=>{
+  const item=normalizeContact(req.body?.contact||req.body||{});
+  const listId=Number(req.body?.listId)||null;
+  const listName=String(req.body?.listName||"").trim();
+  const listNiche=String(req.body?.listNiche||item.segment||"").trim();
+  const listRegion=String(req.body?.listRegion||item.region||item.city||"").trim();
+  if(!emailIsValid(item.email))return res.status(400).json({error:"Informe um e-mail válido"});
+  if(!item.company&&!item.name)return res.status(400).json({error:"Informe a empresa ou o nome do contato"});
+  if(!listId&&!listName)return res.status(400).json({error:"Escolha uma lista ou informe o nome da nova lista"});
+  const client=await pool.connect();
+  try{
+    await client.query("BEGIN");
+    let list;
+    if(listId){
+      list=(await client.query(`SELECT * FROM contact_lists WHERE id=$1 AND status='ready'`,[listId])).rows[0];
+      if(!list){const error=new Error("A lista escolhida não foi encontrada");error.status=404;throw error;}
+    }else{
+      list=(await client.query(`INSERT INTO contact_lists(name,niche,region,qualification,source,criteria,status,created_by) VALUES($1,$2,$3,'manual','manual','Contato incluído manualmente','ready',$4) RETURNING *`,[listName,listNiche,listRegion,req.user.id])).rows[0];
+    }
+    const contact=(await client.query(`INSERT INTO contacts(email,name,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle,status,subscribed)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'valid',TRUE)
+      ON CONFLICT(email) DO UPDATE SET
+        name=COALESCE(NULLIF(EXCLUDED.name,''),contacts.name),company=COALESCE(NULLIF(EXCLUDED.company,''),contacts.company),
+        segment=COALESCE(NULLIF(EXCLUDED.segment,''),contacts.segment),city=COALESCE(NULLIF(EXCLUDED.city,''),contacts.city),
+        region=COALESCE(NULLIF(EXCLUDED.region,''),contacts.region),website=COALESCE(NULLIF(EXCLUDED.website,''),contacts.website),
+        source_url=COALESCE(NULLIF(EXCLUDED.source_url,''),contacts.source_url),qualification_score=EXCLUDED.qualification_score,
+        qualification_label=EXCLUDED.qualification_label,qualification_reason=COALESCE(NULLIF(EXCLUDED.qualification_reason,''),contacts.qualification_reason),
+        suggested_angle=COALESCE(NULLIF(EXCLUDED.suggested_angle,''),contacts.suggested_angle),status='valid',updated_at=NOW()
+      RETURNING *`,[item.email,item.name,item.company,item.segment,item.city,item.region,item.website,item.sourceUrl,item.qualificationScore||50,item.qualificationLabel||"manual",item.qualificationReason,item.suggestedAngle])).rows[0];
+    await client.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,contact.id]);
+    await client.query("COMMIT");
+    res.status(201).json({contact,list});
+  }catch(error){
+    await client.query("ROLLBACK");
+    if(error.status)return res.status(error.status).json({error:error.message});
+    next(error);
+  }finally{client.release();}
+});
 
 app.get("/api/contact-lists", requireUser, async (_req,res,next)=>{
   try { const result=await pool.query(`SELECT l.*,COUNT(m.contact_id)::int contacts,COUNT(m.contact_id) FILTER(WHERE c.status='valid' AND c.subscribed)::int valid_contacts FROM contact_lists l LEFT JOIN contact_list_members m ON m.list_id=l.id LEFT JOIN contacts c ON c.id=m.contact_id GROUP BY l.id ORDER BY l.created_at DESC`); res.json({lists:result.rows}); }catch(error){next(error);}
@@ -433,7 +480,7 @@ async function runGroqBatch({niche,region,quantity,criteria,excludedEmails}){
   const model=process.env.GROQ_PROSPECTION_MODEL||"openai/gpt-oss-120b";
   const prompt=prospectionPrompt({niche,region,quantity,criteria,excludedEmails});
   const response=await fetch("https://api.groq.com/openai/v1/chat/completions",{method:"POST",headers:{authorization:`Bearer ${process.env.GROQ_API_KEY}`,"content-type":"application/json"},body:JSON.stringify({messages:[{role:"user",content:prompt}],model,temperature:0.2,max_completion_tokens:1800,top_p:1,stream:false,reasoning_effort:"low",tool_choice:"required",tools:[{type:"browser_search"}]})});
-  const body=await response.json().catch(()=>({})); if(!response.ok){const error=new Error(body.error?.message||`Falha na Groq (${response.status})`);error.status=response.status;throw error;}
+  const body=await response.json().catch(()=>({})); if(!response.ok){const error=new Error(body.error?.message||`Falha na Groq (${response.status})`);error.status=response.status;const retryAfter=Number(response.headers.get("retry-after"));error.retryAfterMs=Number.isFinite(retryAfter)&&retryAfter>0?Math.ceil(retryAfter*1000):0;throw error;}
   const parsed=extractResearchJson(body.choices?.[0]?.message?.content,"A Groq");
   return {provider:"groq",model,...parsedResearchPayload(parsed,quantity)};
 }
@@ -442,7 +489,7 @@ async function runGeminiBatch({niche,region,quantity,criteria,excludedEmails}){
   const model=process.env.GEMINI_PROSPECTION_MODEL||"gemini-3.6-flash";
   const prompt=prospectionPrompt({niche,region,quantity,criteria,excludedEmails});
   const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:"POST",headers:{"x-goog-api-key":process.env.GEMINI_API_KEY,"content-type":"application/json"},body:JSON.stringify({contents:[{parts:[{text:prompt}]}],tools:[{google_search:{}}],generationConfig:{maxOutputTokens:3000}})});
-  const body=await response.json().catch(()=>({})); if(!response.ok){const error=new Error(body.error?.message||`Falha no Gemini (${response.status})`);error.status=response.status;throw error;}
+  const body=await response.json().catch(()=>({})); if(!response.ok){const error=new Error(body.error?.message||`Falha no Gemini (${response.status})`);error.status=response.status;const retryAfter=Number(response.headers.get("retry-after"));error.retryAfterMs=Number.isFinite(retryAfter)&&retryAfter>0?Math.ceil(retryAfter*1000):0;throw error;}
   const text=(body.candidates?.[0]?.content?.parts||[]).map((part)=>part.text||"").join("\n");
   const parsed=extractResearchJson(text,"O Gemini");
   return {provider:"gemini",model,...parsedResearchPayload(parsed,quantity)};
@@ -467,8 +514,17 @@ async function runAiProspection({niche,region,quantity,criteria}){
   for(let batchIndex=0;batchIndex<totalBatches&&contacts.size<quantity;batchIndex++){
     const ordered=providers.map((_,offset)=>providers[(batchIndex+offset)%providers.length]);let result=null;
     for(const provider of ordered){
-      try{result=await provider.run({niche,region,quantity:Math.min(batchSize,quantity-contacts.size),criteria,excludedEmails:[...contacts.keys()]});break;}
-      catch(error){failures.push(`${provider.name}: ${error.message}`);}
+      const input={niche,region,quantity:Math.min(batchSize,quantity-contacts.size),criteria,excludedEmails:[...contacts.keys()]};
+      try{result=await provider.run(input);break;}
+      catch(error){
+        const delay=retryDelayMs(error);
+        failures.push(`${provider.name}: ${error.message}`);
+        if(delay&&ordered.length===1){
+          await wait(delay+350);
+          try{result=await provider.run(input);break;}
+          catch(retryError){failures.push(`${provider.name} (nova tentativa): ${retryError.message}`);}
+        }
+      }
     }
     if(!result){if(!contacts.size)throw new Error(`A pesquisa falhou nos provedores configurados. ${failures.slice(-providers.length).join(" | ")}`);break;}
     if(result.listName&&!listName)listName=result.listName;models.add(result.model);usedProviders.add(result.provider);
