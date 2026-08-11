@@ -187,9 +187,12 @@ async function initializeDatabase() {
       id BIGSERIAL PRIMARY KEY, list_id BIGINT REFERENCES contact_lists(id) ON DELETE SET NULL,
       niche TEXT NOT NULL, region TEXT NOT NULL, criteria TEXT NOT NULL DEFAULT '', requested_count INTEGER NOT NULL,
       found_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'researching', provider TEXT NOT NULL DEFAULT 'groq',
-      model TEXT, error TEXT, created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      model TEXT, error TEXT, candidate_count INTEGER NOT NULL DEFAULT 0, rejected_count INTEGER NOT NULL DEFAULT 0,
+      created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ
     )`);
+    await pool.query(`ALTER TABLE prospections ADD COLUMN IF NOT EXISTS candidate_count INTEGER NOT NULL DEFAULT 0`);
+    await pool.query(`ALTER TABLE prospections ADD COLUMN IF NOT EXISTS rejected_count INTEGER NOT NULL DEFAULT 0`);
     await pool.query(`CREATE TABLE IF NOT EXISTS campaigns (
       id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '', html_content TEXT NOT NULL DEFAULT '',
       brief TEXT NOT NULL DEFAULT '', source_references JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -460,10 +463,35 @@ async function sourceContainsEmail(sourceUrl,email){
       if(response.status>=300&&response.status<400&&response.headers.get("location")){url=await validatedPublicUrl(new URL(response.headers.get("location"),url).toString());continue;}
       if(!response.ok)return false;
       const contentType=String(response.headers.get("content-type")||"").toLowerCase();if(contentType&&!contentType.includes("text/")&&!contentType.includes("application/xhtml+xml"))return false;
-      const text=(await limitedResponseText(response)).toLowerCase();return text.includes(email.toLowerCase());
+      const text=(await limitedResponseText(response)).toLowerCase()
+        .replace(/&#0*64;|&#x0*40;|&commat;|\s+\[at\]\s+|\s+\(at\)\s+/gi,"@")
+        .replace(/&#0*46;|&#x0*2e;|&period;|\s+\[dot\]\s+|\s+\(dot\)\s+/gi,".")
+        .replace(/&nbsp;|&#0*160;|&#x0*a0;/gi," ");
+      return text.includes(email.toLowerCase());
     }
     return false;
   }catch{return false;}finally{clearTimeout(timeout);}
+}
+const mxCache=new Map();
+async function domainHasMail(domain){
+  if(mxCache.has(domain))return mxCache.get(domain);
+  const check=dns.resolveMx(domain).then((records)=>records.length>0).catch(()=>false);
+  mxCache.set(domain,check);return check;
+}
+function websiteMatchesEmailDomain(website,email){
+  try{
+    const domain=String(email).split("@")[1]?.toLowerCase();
+    const host=new URL(website).hostname.toLowerCase().replace(/^www\./,"");
+    return Boolean(domain&&(host===domain||host.endsWith(`.${domain}`)));
+  }catch{return false;}
+}
+async function contactHasPublicEvidence(item){
+  if(await sourceContainsEmail(item.sourceUrl,item.email))return true;
+  const localPart=item.email.split("@")[0]?.toLowerCase();
+  const roleAddress=/^(contato|comercial|vendas|atendimento|orcamento|orçamento|marketing|engenharia|projetos|administrativo|sac)([._-].*)?$/.test(localPart||"");
+  if(!roleAddress||!websiteMatchesEmailDomain(item.website,item.email))return false;
+  try{await validatedPublicUrl(item.website);}catch{return false;}
+  return domainHasMail(item.email.split("@")[1].toLowerCase());
 }
 function prospectionPrompt({niche,region,quantity,criteria,excludedEmails=[]}){
   const exclusions=excludedEmails.length?` Não repita estes e-mails já encontrados: ${excludedEmails.join(", ")}.`:"";
@@ -499,7 +527,7 @@ async function verifyResearchContacts(items,quantity){
   const verified=[];
   for(let index=0;index<unique.length;index+=5){
     const group=unique.slice(index,index+5);
-    const checks=await Promise.all(group.map(async item=>({item,valid:await sourceContainsEmail(item.sourceUrl,item.email)})));
+    const checks=await Promise.all(group.map(async item=>({item,valid:await contactHasPublicEvidence(item)})));
     verified.push(...checks.filter(check=>check.valid).map(check=>check.item));
   }
   return verified;
@@ -509,12 +537,12 @@ async function runAiProspection({niche,region,quantity,criteria}){
   if(process.env.GROQ_API_KEY)providers.push({name:"groq",run:runGroqBatch});
   if(process.env.GEMINI_API_KEY)providers.push({name:"gemini",run:runGeminiBatch});
   if(!providers.length)throw new Error("Configure GROQ_API_KEY ou GEMINI_API_KEY para executar a Prospecção");
-  const contacts=new Map(),models=new Set(),usedProviders=new Set(),failures=[];let listName="";
-  const batchSize=5,totalBatches=Math.ceil(quantity/batchSize);
+  const candidates=new Map(),contacts=new Map(),models=new Set(),usedProviders=new Set(),failures=[];let listName="";
+  const batchSize=5,totalBatches=Math.max(2,Math.ceil(quantity/batchSize)*2);
   for(let batchIndex=0;batchIndex<totalBatches&&contacts.size<quantity;batchIndex++){
     const ordered=providers.map((_,offset)=>providers[(batchIndex+offset)%providers.length]);let result=null;
     for(const provider of ordered){
-      const input={niche,region,quantity:Math.min(batchSize,quantity-contacts.size),criteria,excludedEmails:[...contacts.keys()]};
+      const input={niche,region,quantity:batchSize,criteria,excludedEmails:[...candidates.keys()]};
       try{result=await provider.run(input);break;}
       catch(error){
         const delay=retryDelayMs(error);
@@ -526,20 +554,27 @@ async function runAiProspection({niche,region,quantity,criteria}){
         }
       }
     }
-    if(!result){if(!contacts.size)throw new Error(`A pesquisa falhou nos provedores configurados. ${failures.slice(-providers.length).join(" | ")}`);break;}
+    if(!result){if(!candidates.size)throw new Error(`A pesquisa falhou nos provedores configurados. ${failures.slice(-providers.length).join(" | ")}`);break;}
     if(result.listName&&!listName)listName=result.listName;models.add(result.model);usedProviders.add(result.provider);
-    for(const item of result.contacts)if(!contacts.has(item.email))contacts.set(item.email,item);
+    const fresh=[];
+    for(const item of result.contacts)if(!candidates.has(item.email)){candidates.set(item.email,item);fresh.push(item);}
+    const verified=await verifyResearchContacts(fresh,batchSize);
+    for(const item of verified)if(!contacts.has(item.email)&&contacts.size<quantity)contacts.set(item.email,item);
   }
-  const verified=await verifyResearchContacts([...contacts.values()],quantity);
-  return {provider:[...usedProviders].join("+"),model:[...models].join(" + "),listName:listName||`${niche} · ${region}`,contacts:verified};
+  return {provider:[...usedProviders].join("+"),model:[...models].join(" + "),listName:listName||`${niche} · ${region}`,contacts:[...contacts.values()],candidateCount:candidates.size,rejectedCount:Math.max(0,candidates.size-contacts.size)};
 }
 app.get("/api/prospections", requireUser, async(_req,res,next)=>{try{const result=await pool.query(`SELECT p.*,l.name list_name FROM prospections p LEFT JOIN contact_lists l ON l.id=p.list_id ORDER BY p.created_at DESC LIMIT 50`);res.json({prospections:result.rows});}catch(error){next(error);}});
+app.delete("/api/prospections", requireUser, async(req,res,next)=>{
+  const ids=[...new Set((Array.isArray(req.body?.ids)?req.body.ids:[]).map(Number).filter(Number.isInteger))].slice(0,50);
+  if(!ids.length)return res.status(400).json({error:"Selecione ao menos uma pesquisa"});
+  try{const result=await pool.query(`DELETE FROM prospections WHERE id=ANY($1::bigint[]) RETURNING id`,[ids]);res.json({deleted:result.rowCount,ids:result.rows.map((row)=>Number(row.id))});}catch(error){next(error);}
+});
 app.post("/api/prospections", requireUser, async(req,res,next)=>{
   const niche=String(req.body?.niche||"").trim(),region=String(req.body?.region||"").trim(),criteria=String(req.body?.criteria||"").trim(),requestedName=String(req.body?.listName||"").trim();const quantity=Math.max(1,Math.min(20,Number(req.body?.quantity)||10));
   if(!niche||!region)return res.status(400).json({error:"Informe o nicho e a região"});
   const configuredModel=[process.env.GROQ_API_KEY&&(process.env.GROQ_PROSPECTION_MODEL||"openai/gpt-oss-120b"),process.env.GEMINI_API_KEY&&(process.env.GEMINI_PROSPECTION_MODEL||"gemini-3.6-flash")].filter(Boolean).join(" + ");
-  let run; try{run=(await pool.query(`INSERT INTO prospections(niche,region,criteria,requested_count,provider,model,created_by) VALUES($1,$2,$3,$4,'ai_fallback',$5,$6) RETURNING *`,[niche,region,criteria,quantity,configuredModel,req.user.id])).rows[0]; const research=await runAiProspection({niche,region,quantity,criteria}); if(!research.contacts.length)throw new Error("A pesquisa não encontrou e-mails corporativos que também aparecessem na página pública informada"); const client=await pool.connect(); try{await client.query("BEGIN"); const list=(await client.query(`INSERT INTO contact_lists(name,niche,region,qualification,source,criteria,created_by) VALUES($1,$2,$3,'qualified','ai_web_search',$4,$5) RETURNING *`,[requestedName||research.listName,niche,region,criteria,req.user.id])).rows[0]; for(const item of research.contacts){const contact=(await client.query(`INSERT INTO contacts(email,name,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle,status,subscribed) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'valid',TRUE) ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,company=EXCLUDED.company,segment=EXCLUDED.segment,city=EXCLUDED.city,region=EXCLUDED.region,website=EXCLUDED.website,source_url=EXCLUDED.source_url,qualification_score=EXCLUDED.qualification_score,qualification_label=EXCLUDED.qualification_label,qualification_reason=EXCLUDED.qualification_reason,suggested_angle=EXCLUDED.suggested_angle,status='valid',updated_at=NOW() RETURNING id`,[item.email,item.name,item.company,item.segment||niche,item.city,item.region||region,item.website,item.sourceUrl,item.qualificationScore,item.qualificationLabel,item.qualificationReason,item.suggestedAngle])).rows[0];await client.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,contact.id]);} await client.query(`UPDATE prospections SET list_id=$1,found_count=$2,status='completed',provider=$3,model=$4,completed_at=NOW() WHERE id=$5`,[list.id,research.contacts.length,research.provider,research.model,run.id]);await client.query("COMMIT");res.status(201).json({prospection:{...run,status:"completed",found_count:research.contacts.length,list_id:list.id,provider:research.provider,model:research.model},list,contacts:research.contacts});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}}
-  catch(error){if(run?.id)await pool.query(`UPDATE prospections SET status='failed',error=$1,completed_at=NOW() WHERE id=$2`,[error.message,run.id]).catch(()=>{});next(error);}
+  let run,research; try{run=(await pool.query(`INSERT INTO prospections(niche,region,criteria,requested_count,provider,model,created_by) VALUES($1,$2,$3,$4,'ai_fallback',$5,$6) RETURNING *`,[niche,region,criteria,quantity,configuredModel,req.user.id])).rows[0]; research=await runAiProspection({niche,region,quantity,criteria}); if(!research.contacts.length){const error=new Error(research.candidateCount?`A IA encontrou ${research.candidateCount} contato(s) candidato(s), mas nenhum passou na validação das fontes públicas. Tente ampliar a região ou ajustar o nicho.`:"Os provedores concluíram a pesquisa, mas não sugeriram e-mails corporativos para estes critérios. Tente ampliar a região ou simplificar os filtros.");error.status=422;throw error;} const client=await pool.connect(); try{await client.query("BEGIN"); const list=(await client.query(`INSERT INTO contact_lists(name,niche,region,qualification,source,criteria,created_by) VALUES($1,$2,$3,'qualified','ai_web_search',$4,$5) RETURNING *`,[requestedName||research.listName,niche,region,criteria,req.user.id])).rows[0]; for(const item of research.contacts){const contact=(await client.query(`INSERT INTO contacts(email,name,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle,status,subscribed) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'valid',TRUE) ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,company=EXCLUDED.company,segment=EXCLUDED.segment,city=EXCLUDED.city,region=EXCLUDED.region,website=EXCLUDED.website,source_url=EXCLUDED.source_url,qualification_score=EXCLUDED.qualification_score,qualification_label=EXCLUDED.qualification_label,qualification_reason=EXCLUDED.qualification_reason,suggested_angle=EXCLUDED.suggested_angle,status='valid',updated_at=NOW() RETURNING id`,[item.email,item.name,item.company,item.segment||niche,item.city,item.region||region,item.website,item.sourceUrl,item.qualificationScore,item.qualificationLabel,item.qualificationReason,item.suggestedAngle])).rows[0];await client.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,contact.id]);} await client.query(`UPDATE prospections SET list_id=$1,found_count=$2,candidate_count=$3,rejected_count=$4,status='completed',provider=$5,model=$6,completed_at=NOW() WHERE id=$7`,[list.id,research.contacts.length,research.candidateCount,research.rejectedCount,research.provider,research.model,run.id]);await client.query("COMMIT");res.status(201).json({prospection:{...run,status:"completed",found_count:research.contacts.length,candidate_count:research.candidateCount,rejected_count:research.rejectedCount,list_id:list.id,provider:research.provider,model:research.model},list,contacts:research.contacts});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}}
+  catch(error){if(run?.id)await pool.query(`UPDATE prospections SET status='failed',error=$1,candidate_count=$2,rejected_count=$3,completed_at=NOW() WHERE id=$4`,[error.message,research?.candidateCount||0,research?.rejectedCount||0,run.id]).catch(()=>{});if(error.status)return res.status(error.status).json({error:error.message,candidateCount:research?.candidateCount||0,rejectedCount:research?.rejectedCount||0});next(error);}
 });
 
 async function accountEmailSender(account, user) {
@@ -612,6 +647,30 @@ app.get("/api/campaigns", requireUser, async(_req,res,next)=>{try{const result=a
 app.post("/api/campaigns", requireUser, async(req,res,next)=>{
   const {name,brief="",sourceReferences=[],senderName=adminName,senderEmail="",contactListId,waves=1,firstSendAt}=req.body||{};if(!name?.trim())return res.status(400).json({error:"O nome da campanha é obrigatório"});if(!contactListId)return res.status(400).json({error:"Selecione a lista de contatos destinatária"});
   try{const list=await pool.query(`SELECT name FROM contact_lists WHERE id=$1 AND status='ready'`,[contactListId]);if(!list.rowCount)return res.status(400).json({error:"Lista não encontrada ou indisponível"});const contactCount=number((await pool.query(`SELECT COUNT(*) FROM contact_list_members m JOIN contacts c ON c.id=m.contact_id WHERE m.list_id=$1 AND c.status='valid' AND c.subscribed`,[contactListId])).rows[0].count);if(!contactCount)return res.status(400).json({error:"A lista escolhida não possui contatos válidos"});const client=await pool.connect();try{await client.query("BEGIN");const campaign=(await client.query(`INSERT INTO campaigns(name,brief,source_references,sender_name,sender_email,audience_label,contact_list_id,owner_id,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'draft') RETURNING *`,[name.trim(),String(brief),JSON.stringify(Array.isArray(sourceReferences)?sourceReferences:[]),senderName,senderEmail,list.rows[0].name,contactListId,req.user.id])).rows[0];const total=Math.min(10,Math.max(1,Number(waves)||1));for(let index=0;index<total;index++){const scheduled=firstSendAt?new Date(new Date(firstSendAt).getTime()+index*24*60*60*1000):null;await client.query(`INSERT INTO campaign_waves(campaign_id,wave_order,scheduled_at,recipient_count,status) VALUES($1,$2,$3,$4,'draft')`,[campaign.id,index+1,scheduled,contactCount]);}await client.query("COMMIT");res.status(201).json({campaign});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}}catch(error){next(error);}
+});
+app.put("/api/campaigns/:id/contact-list", requireUser, async(req,res,next)=>{
+  const contactListId=Number(req.body?.contactListId);
+  if(!contactListId)return res.status(400).json({error:"Selecione a lista de contatos destinatária"});
+  try{
+    const [campaign,list,deliveries]=await Promise.all([
+      pool.query(`SELECT id,contact_list_id FROM campaigns WHERE id=$1`,[req.params.id]),
+      pool.query(`SELECT id,name FROM contact_lists WHERE id=$1 AND status='ready'`,[contactListId]),
+      pool.query(`SELECT 1 FROM campaign_deliveries WHERE campaign_id=$1 LIMIT 1`,[req.params.id])
+    ]);
+    if(!campaign.rowCount)return res.status(404).json({error:"Campanha não encontrada"});
+    if(!list.rowCount)return res.status(400).json({error:"Lista não encontrada ou indisponível"});
+    if(deliveries.rowCount)return res.status(409).json({error:"A lista não pode ser alterada depois que a campanha iniciou os envios"});
+    const contactCount=number((await pool.query(`SELECT COUNT(*) FROM contact_list_members m JOIN contacts c ON c.id=m.contact_id WHERE m.list_id=$1 AND c.status='valid' AND c.subscribed`,[contactListId])).rows[0].count);
+    if(!contactCount)return res.status(400).json({error:"A lista escolhida não possui contatos válidos"});
+    const client=await pool.connect();
+    try{
+      await client.query("BEGIN");
+      const updated=(await client.query(`UPDATE campaigns SET contact_list_id=$1,audience_label=$2,updated_at=NOW() WHERE id=$3 RETURNING *`,[contactListId,list.rows[0].name,req.params.id])).rows[0];
+      await client.query(`UPDATE campaign_waves SET recipient_count=$1 WHERE campaign_id=$2`,[contactCount,req.params.id]);
+      await client.query("COMMIT");
+      res.json({campaign:updated,recipientCount:contactCount});
+    }catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}
+  }catch(error){next(error);}
 });
 app.get("/api/campaigns/:id/waves", requireUser, async(req,res,next)=>{try{const result=await pool.query(`SELECT w.id,w.wave_order,w.scheduled_at,w.recipient_count,w.automation_mode,w.delay_days,w.status,e.id email_id,e.subject,e.html_content,e.preview_text,e.editor_mode,e.layout_json,e.status email_status FROM campaign_waves w LEFT JOIN campaign_emails e ON e.wave_id=w.id WHERE w.campaign_id=$1 ORDER BY w.wave_order`,[req.params.id]);res.json({waves:result.rows});}catch(error){next(error);}});
 app.post("/api/campaigns/:id/waves/:waveId/email", requireUser, async(req,res,next)=>{const{subject,htmlContent="",previewText="",scheduledAt=null,automationMode="dated",delayDays=0,editorMode="visual",layout=[],sendNow=false}=req.body||{};if(!subject?.trim())return res.status(400).json({error:"O assunto é obrigatório"});if(/<script[\s>]/i.test(htmlContent))return res.status(400).json({error:"JavaScript não é permitido em e-mails"});if(!["now","dated","unopened","opened_no_click","no_reply"].includes(automationMode))return res.status(400).json({error:"Regra de envio inválida"});try{const wave=await pool.query(`SELECT id,wave_order,status FROM campaign_waves WHERE id=$1 AND campaign_id=$2`,[req.params.waveId,req.params.id]);if(!wave.rowCount)return res.status(404).json({error:"Onda não encontrada"});if(automationMode==="now"&&Number(wave.rows[0].wave_order)!==1)return res.status(400).json({error:"Enviar agora está disponível somente para a primeira onda"});if(sendNow&&automationMode!=="now")return res.status(400).json({error:"Confirme a regra Enviar agora antes do disparo"});await pool.query(`UPDATE campaign_waves SET scheduled_at=$1,automation_mode=$2,delay_days=$3 WHERE id=$4`,[automationMode==="dated"?scheduledAt:null,automationMode,Math.max(0,Number(delayDays)||0),req.params.waveId]);const saved=await pool.query(`INSERT INTO campaign_emails(campaign_id,wave_id,subject,html_content,preview_text,editor_mode,layout_json,status) VALUES($1,$2,$3,$4,$5,$6,$7,'ready') ON CONFLICT(campaign_id,wave_id) DO UPDATE SET subject=EXCLUDED.subject,html_content=EXCLUDED.html_content,preview_text=EXCLUDED.preview_text,editor_mode=EXCLUDED.editor_mode,layout_json=EXCLUDED.layout_json,status=CASE WHEN campaign_emails.status IN ('completed','partial') THEN campaign_emails.status ELSE 'ready' END,updated_at=NOW() RETURNING *`,[req.params.id,req.params.waveId,subject.trim(),htmlContent,previewText,editorMode,JSON.stringify(Array.isArray(layout)?layout:[])]);await pool.query(`UPDATE campaigns SET subject=$1,updated_at=NOW() WHERE id=$2`,[subject.trim(),req.params.id]);const delivery=sendNow?await sendWaveImmediately({campaignId:req.params.id,waveId:req.params.waveId,user:req.user}):null;res.status(201).json({email:saved.rows[0],delivery});}catch(error){next(error);}});
