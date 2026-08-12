@@ -145,6 +145,7 @@ function retryDelayMs(error) {
 }
 
 let schemaPromise;
+let prospectionRecoveryDone = false;
 async function initializeDatabase() {
   if (!pool) throw new Error("DATABASE_URL não configurada");
   if (!schemaPromise) schemaPromise = (async () => {
@@ -185,12 +186,14 @@ async function initializeDatabase() {
     )`);
     await pool.query(`CREATE TABLE IF NOT EXISTS prospections (
       id BIGSERIAL PRIMARY KEY, list_id BIGINT REFERENCES contact_lists(id) ON DELETE SET NULL,
-      niche TEXT NOT NULL, region TEXT NOT NULL, criteria TEXT NOT NULL DEFAULT '', requested_count INTEGER NOT NULL,
-      found_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'researching', provider TEXT NOT NULL DEFAULT 'groq',
+      niche TEXT NOT NULL, region TEXT NOT NULL, criteria TEXT NOT NULL DEFAULT '', requested_list_name TEXT NOT NULL DEFAULT '',
+      requested_count INTEGER NOT NULL, found_count INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'queued', provider TEXT NOT NULL DEFAULT 'groq',
       model TEXT, error TEXT, candidate_count INTEGER NOT NULL DEFAULT 0, rejected_count INTEGER NOT NULL DEFAULT 0,
       created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), completed_at TIMESTAMPTZ
     )`);
+    await pool.query(`ALTER TABLE prospections ADD COLUMN IF NOT EXISTS requested_list_name TEXT NOT NULL DEFAULT ''`);
     await pool.query(`ALTER TABLE prospections ADD COLUMN IF NOT EXISTS candidate_count INTEGER NOT NULL DEFAULT 0`);
     await pool.query(`ALTER TABLE prospections ADD COLUMN IF NOT EXISTS rejected_count INTEGER NOT NULL DEFAULT 0`);
     await pool.query(`CREATE TABLE IF NOT EXISTS campaigns (
@@ -271,6 +274,17 @@ async function initializeDatabase() {
     if (user) for (const [name, type, html] of defaults) await pool.query(`INSERT INTO email_templates(user_id,name,template_type,html_content)
       SELECT $1,$2,$3,$4 WHERE NOT EXISTS(SELECT 1 FROM email_templates WHERE user_id=$1 AND name=$2)`, [user.id, name, type, html]);
   })().catch((error) => { schemaPromise = undefined; throw error; });
+  await schemaPromise;
+  if (!prospectionRecoveryDone) {
+    prospectionRecoveryDone = true;
+    try {
+      await pool.query(`UPDATE prospections SET status='queued',error=NULL,completed_at=NULL WHERE status='researching' AND completed_at IS NULL`);
+      setImmediate(scheduleProspectionDrain);
+    } catch (error) {
+      prospectionRecoveryDone = false;
+      throw error;
+    }
+  }
   return schemaPromise;
 }
 async function requireDatabase(_req, res, next) {
@@ -507,7 +521,7 @@ async function runGroqBatch({niche,region,quantity,criteria,excludedEmails}){
   if(!process.env.GROQ_API_KEY)throw new Error("GROQ_API_KEY não configurada");
   const model=process.env.GROQ_PROSPECTION_MODEL||"openai/gpt-oss-120b";
   const prompt=prospectionPrompt({niche,region,quantity,criteria,excludedEmails});
-  const response=await fetch("https://api.groq.com/openai/v1/chat/completions",{method:"POST",headers:{authorization:`Bearer ${process.env.GROQ_API_KEY}`,"content-type":"application/json"},body:JSON.stringify({messages:[{role:"user",content:prompt}],model,temperature:0.2,max_completion_tokens:1800,top_p:1,stream:false,reasoning_effort:"low",tool_choice:"required",tools:[{type:"browser_search"}]})});
+  const response=await fetch("https://api.groq.com/openai/v1/chat/completions",{method:"POST",headers:{authorization:`Bearer ${process.env.GROQ_API_KEY}`,"content-type":"application/json"},body:JSON.stringify({messages:[{role:"user",content:prompt}],model,temperature:0.2,max_completion_tokens:1800,top_p:1,stream:false,reasoning_effort:"low",tool_choice:"required",tools:[{type:"browser_search"}]}),signal:AbortSignal.timeout(45000)});
   const body=await response.json().catch(()=>({})); if(!response.ok){const error=new Error(body.error?.message||`Falha na Groq (${response.status})`);error.status=response.status;const retryAfter=Number(response.headers.get("retry-after"));error.retryAfterMs=Number.isFinite(retryAfter)&&retryAfter>0?Math.ceil(retryAfter*1000):0;throw error;}
   const parsed=extractResearchJson(body.choices?.[0]?.message?.content,"A Groq");
   return {provider:"groq",model,...parsedResearchPayload(parsed,quantity)};
@@ -516,7 +530,7 @@ async function runGeminiBatch({niche,region,quantity,criteria,excludedEmails}){
   if(!process.env.GEMINI_API_KEY)throw new Error("GEMINI_API_KEY não configurada");
   const model=process.env.GEMINI_PROSPECTION_MODEL||"gemini-3.6-flash";
   const prompt=prospectionPrompt({niche,region,quantity,criteria,excludedEmails});
-  const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:"POST",headers:{"x-goog-api-key":process.env.GEMINI_API_KEY,"content-type":"application/json"},body:JSON.stringify({contents:[{parts:[{text:prompt}]}],tools:[{google_search:{}}],generationConfig:{maxOutputTokens:3000}})});
+  const response=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,{method:"POST",headers:{"x-goog-api-key":process.env.GEMINI_API_KEY,"content-type":"application/json"},body:JSON.stringify({contents:[{parts:[{text:prompt}]}],tools:[{google_search:{}}],generationConfig:{maxOutputTokens:3000}}),signal:AbortSignal.timeout(45000)});
   const body=await response.json().catch(()=>({})); if(!response.ok){const error=new Error(body.error?.message||`Falha no Gemini (${response.status})`);error.status=response.status;const retryAfter=Number(response.headers.get("retry-after"));error.retryAfterMs=Number.isFinite(retryAfter)&&retryAfter>0?Math.ceil(retryAfter*1000):0;throw error;}
   const text=(body.candidates?.[0]?.content?.parts||[]).map((part)=>part.text||"").join("\n");
   const parsed=extractResearchJson(text,"O Gemini");
@@ -563,18 +577,93 @@ async function runAiProspection({niche,region,quantity,criteria}){
   }
   return {provider:[...usedProviders].join("+"),model:[...models].join(" + "),listName:listName||`${niche} · ${region}`,contacts:[...contacts.values()],candidateCount:candidates.size,rejectedCount:Math.max(0,candidates.size-contacts.size)};
 }
+
+let prospectionDrainPromise = null;
+let prospectionDrainRequested = false;
+function scheduleProspectionDrain() {
+  prospectionDrainRequested = true;
+  if (prospectionDrainPromise) return prospectionDrainPromise;
+  prospectionDrainPromise = new Promise((resolve) => setImmediate(resolve))
+    .then(async () => {
+      do {
+        prospectionDrainRequested = false;
+        await drainProspectionQueue();
+      } while (prospectionDrainRequested);
+    })
+    .catch((error) => console.error("Falha na fila de prospecção", error))
+    .finally(() => { prospectionDrainPromise = null; });
+  return prospectionDrainPromise;
+}
+async function claimNextProspection() {
+  const result = await pool.query(`WITH next_run AS (
+    SELECT id FROM prospections WHERE status='queued' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
+  ) UPDATE prospections p SET status='researching',error=NULL FROM next_run WHERE p.id=next_run.id RETURNING p.*`);
+  return result.rows[0] || null;
+}
+async function completeProspection(run, research) {
+  if (!research.contacts.length) {
+    const error = new Error(research.candidateCount
+      ? `A IA encontrou ${research.candidateCount} contato(s) candidato(s), mas nenhum passou na validação das fontes públicas. Tente ampliar a região ou ajustar o nicho.`
+      : "Os provedores concluíram a pesquisa, mas não sugeriram e-mails corporativos para estes critérios. Tente ampliar a região ou simplificar os filtros.");
+    error.status = 422;
+    throw error;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const list = (await client.query(`INSERT INTO contact_lists(name,niche,region,qualification,source,criteria,created_by) VALUES($1,$2,$3,'qualified','ai_web_search',$4,$5) RETURNING *`,[run.requested_list_name||research.listName,run.niche,run.region,run.criteria,run.created_by])).rows[0];
+    for (const item of research.contacts) {
+      const contact = (await client.query(`INSERT INTO contacts(email,name,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle,status,subscribed) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'valid',TRUE) ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,company=EXCLUDED.company,segment=EXCLUDED.segment,city=EXCLUDED.city,region=EXCLUDED.region,website=EXCLUDED.website,source_url=EXCLUDED.source_url,qualification_score=EXCLUDED.qualification_score,qualification_label=EXCLUDED.qualification_label,qualification_reason=EXCLUDED.qualification_reason,suggested_angle=EXCLUDED.suggested_angle,status='valid',updated_at=NOW() RETURNING id`,[item.email,item.name,item.company,item.segment||run.niche,item.city,item.region||run.region,item.website,item.sourceUrl,item.qualificationScore,item.qualificationLabel,item.qualificationReason,item.suggestedAngle])).rows[0];
+      await client.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,contact.id]);
+    }
+    await client.query(`UPDATE prospections SET list_id=$1,found_count=$2,candidate_count=$3,rejected_count=$4,status='completed',provider=$5,model=$6,error=NULL,completed_at=NOW() WHERE id=$7`,[list.id,research.contacts.length,research.candidateCount,research.rejectedCount,research.provider,research.model,run.id]);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+async function processProspection(run) {
+  let research;
+  try {
+    research = await runAiProspection({niche:run.niche,region:run.region,quantity:number(run.requested_count),criteria:run.criteria});
+    await completeProspection(run,research);
+  } catch (error) {
+    await pool.query(`UPDATE prospections SET status='failed',error=$1,candidate_count=$2,rejected_count=$3,completed_at=NOW() WHERE id=$4`,[String(error.message||error).slice(0,2000),research?.candidateCount||0,research?.rejectedCount||0,run.id]).catch(()=>{});
+  }
+}
+async function drainProspectionQueue() {
+  while (true) {
+    const run = await claimNextProspection();
+    if (!run) return;
+    await processProspection(run);
+  }
+}
+async function prospectionPayload(id) {
+  const run = (await pool.query(`SELECT p.*,l.name list_name FROM prospections p LEFT JOIN contact_lists l ON l.id=p.list_id WHERE p.id=$1`,[id])).rows[0];
+  if (!run) return null;
+  let list = null, contacts = [];
+  if (run.list_id) {
+    list = (await pool.query(`SELECT l.*,COUNT(m.contact_id)::int contacts,COUNT(m.contact_id) FILTER(WHERE c.status='valid' AND c.subscribed)::int valid_contacts FROM contact_lists l LEFT JOIN contact_list_members m ON m.list_id=l.id LEFT JOIN contacts c ON c.id=m.contact_id WHERE l.id=$1 GROUP BY l.id`,[run.list_id])).rows[0] || null;
+    contacts = (await pool.query(`SELECT c.* FROM contacts c JOIN contact_list_members m ON m.contact_id=c.id WHERE m.list_id=$1 ORDER BY c.qualification_score DESC,c.company`,[run.list_id])).rows;
+  }
+  return {prospection:run,list,contacts};
+}
 app.get("/api/prospections", requireUser, async(_req,res,next)=>{try{const result=await pool.query(`SELECT p.*,l.name list_name FROM prospections p LEFT JOIN contact_lists l ON l.id=p.list_id ORDER BY p.created_at DESC LIMIT 50`);res.json({prospections:result.rows});}catch(error){next(error);}});
+app.get("/api/prospections/:id", requireUser, async(req,res,next)=>{try{const payload=await prospectionPayload(req.params.id);if(!payload)return res.status(404).json({error:"Pesquisa não encontrada"});res.json(payload);}catch(error){next(error);}});
 app.delete("/api/prospections", requireUser, async(req,res,next)=>{
   const ids=[...new Set((Array.isArray(req.body?.ids)?req.body.ids:[]).map(Number).filter(Number.isInteger))].slice(0,50);
   if(!ids.length)return res.status(400).json({error:"Selecione ao menos uma pesquisa"});
-  try{const result=await pool.query(`DELETE FROM prospections WHERE id=ANY($1::bigint[]) RETURNING id`,[ids]);res.json({deleted:result.rowCount,ids:result.rows.map((row)=>Number(row.id))});}catch(error){next(error);}
+  try{const result=await pool.query(`DELETE FROM prospections WHERE id=ANY($1::bigint[]) AND status NOT IN ('queued','researching') RETURNING id`,[ids]);res.json({deleted:result.rowCount,skipped:ids.length-result.rowCount,ids:result.rows.map((row)=>Number(row.id))});}catch(error){next(error);}
 });
 app.post("/api/prospections", requireUser, async(req,res,next)=>{
   const niche=String(req.body?.niche||"").trim(),region=String(req.body?.region||"").trim(),criteria=String(req.body?.criteria||"").trim(),requestedName=String(req.body?.listName||"").trim();const quantity=Math.max(1,Math.min(20,Number(req.body?.quantity)||10));
   if(!niche||!region)return res.status(400).json({error:"Informe o nicho e a região"});
   const configuredModel=[process.env.GROQ_API_KEY&&(process.env.GROQ_PROSPECTION_MODEL||"openai/gpt-oss-120b"),process.env.GEMINI_API_KEY&&(process.env.GEMINI_PROSPECTION_MODEL||"gemini-3.6-flash")].filter(Boolean).join(" + ");
-  let run,research; try{run=(await pool.query(`INSERT INTO prospections(niche,region,criteria,requested_count,provider,model,created_by) VALUES($1,$2,$3,$4,'ai_fallback',$5,$6) RETURNING *`,[niche,region,criteria,quantity,configuredModel,req.user.id])).rows[0]; research=await runAiProspection({niche,region,quantity,criteria}); if(!research.contacts.length){const error=new Error(research.candidateCount?`A IA encontrou ${research.candidateCount} contato(s) candidato(s), mas nenhum passou na validação das fontes públicas. Tente ampliar a região ou ajustar o nicho.`:"Os provedores concluíram a pesquisa, mas não sugeriram e-mails corporativos para estes critérios. Tente ampliar a região ou simplificar os filtros.");error.status=422;throw error;} const client=await pool.connect(); try{await client.query("BEGIN"); const list=(await client.query(`INSERT INTO contact_lists(name,niche,region,qualification,source,criteria,created_by) VALUES($1,$2,$3,'qualified','ai_web_search',$4,$5) RETURNING *`,[requestedName||research.listName,niche,region,criteria,req.user.id])).rows[0]; for(const item of research.contacts){const contact=(await client.query(`INSERT INTO contacts(email,name,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle,status,subscribed) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'valid',TRUE) ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,company=EXCLUDED.company,segment=EXCLUDED.segment,city=EXCLUDED.city,region=EXCLUDED.region,website=EXCLUDED.website,source_url=EXCLUDED.source_url,qualification_score=EXCLUDED.qualification_score,qualification_label=EXCLUDED.qualification_label,qualification_reason=EXCLUDED.qualification_reason,suggested_angle=EXCLUDED.suggested_angle,status='valid',updated_at=NOW() RETURNING id`,[item.email,item.name,item.company,item.segment||niche,item.city,item.region||region,item.website,item.sourceUrl,item.qualificationScore,item.qualificationLabel,item.qualificationReason,item.suggestedAngle])).rows[0];await client.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,contact.id]);} await client.query(`UPDATE prospections SET list_id=$1,found_count=$2,candidate_count=$3,rejected_count=$4,status='completed',provider=$5,model=$6,completed_at=NOW() WHERE id=$7`,[list.id,research.contacts.length,research.candidateCount,research.rejectedCount,research.provider,research.model,run.id]);await client.query("COMMIT");res.status(201).json({prospection:{...run,status:"completed",found_count:research.contacts.length,candidate_count:research.candidateCount,rejected_count:research.rejectedCount,list_id:list.id,provider:research.provider,model:research.model},list,contacts:research.contacts});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}}
-  catch(error){if(run?.id)await pool.query(`UPDATE prospections SET status='failed',error=$1,candidate_count=$2,rejected_count=$3,completed_at=NOW() WHERE id=$4`,[error.message,research?.candidateCount||0,research?.rejectedCount||0,run.id]).catch(()=>{});if(error.status)return res.status(error.status).json({error:error.message,candidateCount:research?.candidateCount||0,rejectedCount:research?.rejectedCount||0});next(error);}
+  try{const run=(await pool.query(`INSERT INTO prospections(niche,region,criteria,requested_list_name,requested_count,status,provider,model,created_by) VALUES($1,$2,$3,$4,$5,'queued','ai_fallback',$6,$7) RETURNING *`,[niche,region,criteria,requestedName,quantity,configuredModel,req.user.id])).rows[0];res.status(202).json({prospection:run});scheduleProspectionDrain();}
+  catch(error){next(error);}
 });
 
 async function accountEmailSender(account, user) {
