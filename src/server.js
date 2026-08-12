@@ -136,12 +136,25 @@ function corporateEmailIsValid(email) {
 }
 function emailIsValid(email) { return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(email || "")); }
 function wait(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
-function retryDelayMs(error) {
-  if (Number(error?.status) !== 429) return 0;
+function rateLimitDetails(error) {
+  const message = String(error?.message || "");
+  const limited = Number(error?.status) === 429 || /rate limit|limite de (?:uso|requisi|token)/i.test(message);
+  if (!limited) return { limited:false, daily:false, retryMs:0 };
+  const daily = /\b(?:TPD|RPD|ASD)\b|(?:tokens|requests|requisi(?:ç|c)[õo]es).*per day|por dia|cota di[aá]ria/i.test(message);
   const explicit = Number(error?.retryAfterMs || 0);
-  if (explicit > 0) return Math.min(30000, Math.max(1000, explicit));
-  const match = String(error?.message || "").match(/(?:try again in|tente novamente em)\s*([\d.]+)s/i);
-  return Math.min(30000, Math.max(1000, Math.ceil(Number(match?.[1] || 20) * 1000)));
+  const duration = message.match(/(?:try again in|tente novamente em)\s*(?:(\d+(?:\.\d+)?)m)?\s*(?:(\d+(?:\.\d+)?)s)?/i);
+  const parsed = duration
+    ? Math.ceil((Number(duration[1] || 0) * 60 + Number(duration[2] || 0)) * 1000)
+    : 0;
+  return { limited:true, daily, retryMs:Math.max(0, explicit || parsed || 20000) };
+}
+function providerFailureSummary(providerName, error) {
+  const label = providerName === "gemini" ? "Gemini" : "Groq";
+  const limit = rateLimitDetails(error);
+  if (limit.daily) return `${label} atingiu a cota diária e foi pausado nesta pesquisa`;
+  if (limit.limited) return `${label} atingiu o limite temporário de uso`;
+  if ([401,403].includes(Number(error?.status))) return `${label} recusou a chave configurada`;
+  return `${label} falhou: ${String(error?.message || "erro não identificado").slice(0,240)}`;
 }
 
 let schemaPromise;
@@ -180,6 +193,7 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE contact_lists ADD COLUMN IF NOT EXISTS criteria TEXT NOT NULL DEFAULT ''`);
     await pool.query(`ALTER TABLE contact_lists ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ready'`);
     await pool.query(`ALTER TABLE contact_lists ADD COLUMN IF NOT EXISTS created_by BIGINT REFERENCES users(id) ON DELETE SET NULL`);
+    await pool.query(`ALTER TABLE contact_lists ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
     await pool.query(`CREATE TABLE IF NOT EXISTS contact_list_members (
       list_id BIGINT REFERENCES contact_lists(id) ON DELETE CASCADE,
       contact_id BIGINT REFERENCES contacts(id) ON DELETE CASCADE, PRIMARY KEY(list_id, contact_id)
@@ -251,8 +265,13 @@ async function initializeDatabase() {
       email TEXT, display_name TEXT, reply_to TEXT, signature_html TEXT NOT NULL DEFAULT '', signature_text TEXT NOT NULL DEFAULT '',
       smtp_host TEXT, smtp_port INTEGER, smtp_secure BOOLEAN NOT NULL DEFAULT TRUE, smtp_user TEXT, smtp_password_enc TEXT,
       microsoft_access_token_enc TEXT, microsoft_refresh_token_enc TEXT, microsoft_expires_at TIMESTAMPTZ,
-      connected_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      connected_at TIMESTAMPTZ, connection_status TEXT NOT NULL DEFAULT 'not_configured', connection_error TEXT,
+      connection_checked_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
+    await pool.query(`ALTER TABLE user_email_settings ADD COLUMN IF NOT EXISTS connection_status TEXT NOT NULL DEFAULT 'not_configured'`);
+    await pool.query(`ALTER TABLE user_email_settings ADD COLUMN IF NOT EXISTS connection_error TEXT`);
+    await pool.query(`ALTER TABLE user_email_settings ADD COLUMN IF NOT EXISTS connection_checked_at TIMESTAMPTZ`);
+    await pool.query(`UPDATE user_email_settings SET connection_status='connected',connection_checked_at=COALESCE(connection_checked_at,connected_at) WHERE provider='microsoft' AND connected_at IS NOT NULL AND connection_status='not_configured'`);
     await pool.query(`CREATE TABLE IF NOT EXISTS oauth_states (
       state_hash TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -357,7 +376,7 @@ app.post("/api/auth/logout", requireUser, async (req, res, next) => {
 
 app.get("/api/config/status", requireUser, async (req, res, next) => {
   try {
-    const account=(await pool.query(`SELECT provider,email,connected_at FROM user_email_settings WHERE user_id=$1`,[req.user.id])).rows[0];
+    const account=(await pool.query(`SELECT provider,email,connected_at,connection_status,connection_error,connection_checked_at FROM user_email_settings WHERE user_id=$1`,[req.user.id])).rows[0];
     res.json({ database:true, groq:Boolean(process.env.GROQ_API_KEY), groqModel:process.env.GROQ_PROSPECTION_MODEL||"openai/gpt-oss-120b", gemini:Boolean(process.env.GEMINI_API_KEY), geminiModel:process.env.GEMINI_PROSPECTION_MODEL||"gemini-3.6-flash", microsoft:Boolean(process.env.MICROSOFT_TENANT_ID&&process.env.MICROSOFT_CLIENT_ID&&process.env.MICROSOFT_CLIENT_SECRET), account:account||null });
   } catch(error){next(error);}
 });
@@ -392,6 +411,7 @@ app.post("/api/contacts/manual", requireUser, async(req,res,next)=>{
   if(!emailIsValid(item.email))return res.status(400).json({error:"Informe um e-mail válido"});
   if(!item.company&&!item.name)return res.status(400).json({error:"Informe a empresa ou o nome do contato"});
   if(!listId&&!listName)return res.status(400).json({error:"Escolha uma lista ou informe o nome da nova lista"});
+  if(listId){try{await ensureListMembershipEditable(listId);}catch(error){return res.status(error.status||409).json({error:error.message});}}
   const client=await pool.connect();
   try{
     await client.query("BEGIN");
@@ -414,6 +434,7 @@ app.post("/api/contacts/manual", requireUser, async(req,res,next)=>{
       RETURNING *`,[item.email,item.name,item.company,item.segment,item.city,item.region,item.website,item.sourceUrl,item.qualificationScore||50,item.qualificationLabel||"manual",item.qualificationReason,item.suggestedAngle])).rows[0];
     await client.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,contact.id]);
     await client.query("COMMIT");
+    if(listId)await refreshLinkedCampaignRecipients(list.id);
     res.status(201).json({contact,list});
   }catch(error){
     await client.query("ROLLBACK");
@@ -421,6 +442,19 @@ app.post("/api/contacts/manual", requireUser, async(req,res,next)=>{
     next(error);
   }finally{client.release();}
 });
+
+async function ensureListMembershipEditable(listId){
+  const list=(await pool.query(`SELECT id FROM contact_lists WHERE id=$1 AND status='ready'`,[listId])).rows[0];
+  if(!list){const error=new Error("Lista não encontrada ou indisponível");error.status=404;throw error;}
+  const started=await pool.query(`SELECT 1 FROM campaigns c JOIN campaign_deliveries d ON d.campaign_id=c.id WHERE c.contact_list_id=$1 LIMIT 1`,[listId]);
+  if(started.rowCount){const error=new Error("Os contatos desta lista não podem ser alterados porque uma campanha vinculada já iniciou os envios. Duplique a lista para criar uma nova versão.");error.status=409;throw error;}
+  return list;
+}
+async function refreshLinkedCampaignRecipients(listId){
+  const count=number((await pool.query(`SELECT COUNT(*) FROM contact_list_members m JOIN contacts c ON c.id=m.contact_id WHERE m.list_id=$1 AND c.status='valid' AND c.subscribed`,[listId])).rows[0].count);
+  await pool.query(`UPDATE campaign_waves w SET recipient_count=$1 FROM campaigns c WHERE w.campaign_id=c.id AND c.contact_list_id=$2 AND NOT EXISTS(SELECT 1 FROM campaign_deliveries d WHERE d.campaign_id=c.id)`,[count,listId]);
+  return count;
+}
 
 app.get("/api/contact-lists", requireUser, async (_req,res,next)=>{
   try { const result=await pool.query(`SELECT l.*,COUNT(m.contact_id)::int contacts,COUNT(m.contact_id) FILTER(WHERE c.status='valid' AND c.subscribed)::int valid_contacts FROM contact_lists l LEFT JOIN contact_list_members m ON m.list_id=l.id LEFT JOIN contacts c ON c.id=m.contact_id GROUP BY l.id ORDER BY l.created_at DESC`); res.json({lists:result.rows}); }catch(error){next(error);}
@@ -431,6 +465,36 @@ app.get("/api/contact-lists/:id", requireUser, async(req,res,next)=>{
 app.post("/api/contact-lists", requireUser, async(req,res,next)=>{
   const {name,niche="",region="",qualification="qualified",source="manual",criteria="",contactIds=[]}=req.body||{}; if(!name?.trim())return res.status(400).json({error:"O nome da lista é obrigatório"});
   try { const client=await pool.connect(); try{await client.query("BEGIN"); const list=(await client.query(`INSERT INTO contact_lists(name,niche,region,qualification,source,criteria,created_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[name.trim(),niche,region,qualification,source,criteria,req.user.id])).rows[0]; for(const id of Array.isArray(contactIds)?contactIds:[])await client.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,id]); await client.query("COMMIT");res.status(201).json({list});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();} }catch(error){next(error);}
+});
+app.put("/api/contact-lists/:id",requireUser,async(req,res,next)=>{
+  const name=String(req.body?.name||"").trim(),niche=String(req.body?.niche||"").trim(),region=String(req.body?.region||"").trim(),criteria=String(req.body?.criteria||"").trim();
+  if(!name)return res.status(400).json({error:"O nome da lista é obrigatório"});
+  try{
+    const result=await pool.query(`UPDATE contact_lists SET name=$1,niche=$2,region=$3,criteria=$4,updated_at=NOW() WHERE id=$5 RETURNING *`,[name,niche,region,criteria,req.params.id]);
+    if(!result.rowCount)return res.status(404).json({error:"Lista não encontrada"});
+    await pool.query(`UPDATE campaigns SET audience_label=$1,updated_at=NOW() WHERE contact_list_id=$2 AND NOT EXISTS(SELECT 1 FROM campaign_deliveries d WHERE d.campaign_id=campaigns.id)`,[name,req.params.id]);
+    res.json({list:result.rows[0]});
+  }catch(error){next(error);}
+});
+app.post("/api/contact-lists/:id/members",requireUser,async(req,res,next)=>{
+  const ids=[...new Set((Array.isArray(req.body?.contactIds)?req.body.contactIds:[]).map(Number).filter(Number.isInteger))].slice(0,500);
+  if(!ids.length)return res.status(400).json({error:"Selecione ao menos um contato"});
+  try{
+    await ensureListMembershipEditable(req.params.id);
+    const result=await pool.query(`INSERT INTO contact_list_members(list_id,contact_id) SELECT $1,id FROM contacts WHERE id=ANY($2::bigint[]) ON CONFLICT DO NOTHING RETURNING contact_id`,[req.params.id,ids]);
+    const recipientCount=await refreshLinkedCampaignRecipients(req.params.id);
+    res.json({added:result.rowCount,recipientCount});
+  }catch(error){if(error.status)return res.status(error.status).json({error:error.message});next(error);}
+});
+app.delete("/api/contact-lists/:id/members",requireUser,async(req,res,next)=>{
+  const ids=[...new Set((Array.isArray(req.body?.contactIds)?req.body.contactIds:[]).map(Number).filter(Number.isInteger))].slice(0,500);
+  if(!ids.length)return res.status(400).json({error:"Selecione ao menos um contato"});
+  try{
+    await ensureListMembershipEditable(req.params.id);
+    const result=await pool.query(`DELETE FROM contact_list_members WHERE list_id=$1 AND contact_id=ANY($2::bigint[]) RETURNING contact_id`,[req.params.id,ids]);
+    const recipientCount=await refreshLinkedCampaignRecipients(req.params.id);
+    res.json({removed:result.rowCount,recipientCount});
+  }catch(error){if(error.status)return res.status(error.status).json({error:error.message});next(error);}
 });
 app.delete("/api/contact-lists/:id", requireUser, async(req,res,next)=>{try{const used=await pool.query(`SELECT 1 FROM campaigns WHERE contact_list_id=$1 LIMIT 1`,[req.params.id]);if(used.rowCount)return res.status(409).json({error:"Esta lista está vinculada a uma campanha"});await pool.query(`DELETE FROM contact_lists WHERE id=$1`,[req.params.id]);res.json({ok:true});}catch(error){next(error);}});
 
@@ -548,34 +612,57 @@ async function verifyResearchContacts(items,quantity){
 }
 async function runAiProspection({niche,region,quantity,criteria}){
   const providers=[];
-  if(process.env.GROQ_API_KEY)providers.push({name:"groq",run:runGroqBatch});
-  if(process.env.GEMINI_API_KEY)providers.push({name:"gemini",run:runGeminiBatch});
+  if(process.env.GROQ_API_KEY)providers.push({name:"groq",run:runGroqBatch,disabled:false,cooldownUntil:0});
+  if(process.env.GEMINI_API_KEY)providers.push({name:"gemini",run:runGeminiBatch,disabled:false,cooldownUntil:0});
   if(!providers.length)throw new Error("Configure GROQ_API_KEY ou GEMINI_API_KEY para executar a Prospecção");
   const candidates=new Map(),contacts=new Map(),models=new Set(),usedProviders=new Set(),failures=[];let listName="";
   const batchSize=5,totalBatches=Math.max(2,Math.ceil(quantity/batchSize)*2);
   for(let batchIndex=0;batchIndex<totalBatches&&contacts.size<quantity;batchIndex++){
-    const ordered=providers.map((_,offset)=>providers[(batchIndex+offset)%providers.length]);let result=null;
+    const ordered=providers.map((_,offset)=>providers[(batchIndex+offset)%providers.length]).filter((provider)=>!provider.disabled);let result=null;
     for(const provider of ordered){
       const input={niche,region,quantity:batchSize,criteria,excludedEmails:[...candidates.keys()]};
+      if(provider.cooldownUntil>Date.now()){
+        const alternative=ordered.some((candidate)=>candidate!==provider&&!candidate.disabled&&candidate.cooldownUntil<=Date.now());
+        if(alternative)continue;
+        const remaining=provider.cooldownUntil-Date.now();
+        if(remaining>30000)continue;
+        await wait(remaining+350);
+      }
       try{result=await provider.run(input);break;}
       catch(error){
-        const delay=retryDelayMs(error);
-        failures.push(`${provider.name}: ${error.message}`);
-        if(delay&&ordered.length===1){
-          await wait(delay+350);
+        const limit=rateLimitDetails(error);
+        failures.push(providerFailureSummary(provider.name,error));
+        if(limit.daily)provider.disabled=true;
+        else if(limit.limited)provider.cooldownUntil=Date.now()+limit.retryMs;
+        const alternative=ordered.some((candidate)=>candidate!==provider&&!candidate.disabled&&candidate.cooldownUntil<=Date.now());
+        if(limit.limited&&!limit.daily&&!alternative&&limit.retryMs<=30000){
+          await wait(limit.retryMs+350);
           try{result=await provider.run(input);break;}
-          catch(retryError){failures.push(`${provider.name} (nova tentativa): ${retryError.message}`);}
+          catch(retryError){
+            const retryLimit=rateLimitDetails(retryError);
+            failures.push(providerFailureSummary(provider.name,retryError));
+            if(retryLimit.daily)provider.disabled=true;
+            else if(retryLimit.limited)provider.cooldownUntil=Date.now()+retryLimit.retryMs;
+          }
         }
       }
     }
-    if(!result){if(!candidates.size)throw new Error(`A pesquisa falhou nos provedores configurados. ${failures.slice(-providers.length).join(" | ")}`);break;}
+    if(!result){
+      if(candidates.size||contacts.size)break;
+      const geminiMissing=!providers.some((provider)=>provider.name==="gemini");
+      const detail=[...new Set(failures)].slice(-3).join(" | ");
+      throw new Error(`A pesquisa falhou nos provedores disponíveis. ${detail||"Nenhum provedor respondeu."}${geminiMissing?" O Gemini não está configurado no servidor; cadastre GEMINI_API_KEY para ativar a continuidade automática.":""}`);
+    }
     if(result.listName&&!listName)listName=result.listName;models.add(result.model);usedProviders.add(result.provider);
     const fresh=[];
     for(const item of result.contacts)if(!candidates.has(item.email)){candidates.set(item.email,item);fresh.push(item);}
     const verified=await verifyResearchContacts(fresh,batchSize);
     for(const item of verified)if(!contacts.has(item.email)&&contacts.size<quantity)contacts.set(item.email,item);
   }
-  return {provider:[...usedProviders].join("+"),model:[...models].join(" + "),listName:listName||`${niche} · ${region}`,contacts:[...contacts.values()],candidateCount:candidates.size,rejectedCount:Math.max(0,candidates.size-contacts.size)};
+  const warning=contacts.size<quantity&&failures.length
+    ? `Resultado parcial: ${contacts.size} de ${quantity} contato(s). ${[...new Set(failures)].slice(-2).join(" | ")}`
+    : null;
+  return {provider:[...usedProviders].join("+")||"indisponível",model:[...models].join(" + "),listName:listName||`${niche} · ${region}`,contacts:[...contacts.values()],candidateCount:candidates.size,rejectedCount:Math.max(0,candidates.size-contacts.size),warning};
 }
 
 let prospectionDrainPromise = null;
@@ -616,7 +703,7 @@ async function completeProspection(run, research) {
       const contact = (await client.query(`INSERT INTO contacts(email,name,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle,status,subscribed) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'valid',TRUE) ON CONFLICT(email) DO UPDATE SET name=EXCLUDED.name,company=EXCLUDED.company,segment=EXCLUDED.segment,city=EXCLUDED.city,region=EXCLUDED.region,website=EXCLUDED.website,source_url=EXCLUDED.source_url,qualification_score=EXCLUDED.qualification_score,qualification_label=EXCLUDED.qualification_label,qualification_reason=EXCLUDED.qualification_reason,suggested_angle=EXCLUDED.suggested_angle,status='valid',updated_at=NOW() RETURNING id`,[item.email,item.name,item.company,item.segment||run.niche,item.city,item.region||run.region,item.website,item.sourceUrl,item.qualificationScore,item.qualificationLabel,item.qualificationReason,item.suggestedAngle])).rows[0];
       await client.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,contact.id]);
     }
-    await client.query(`UPDATE prospections SET list_id=$1,found_count=$2,candidate_count=$3,rejected_count=$4,status='completed',provider=$5,model=$6,error=NULL,completed_at=NOW() WHERE id=$7`,[list.id,research.contacts.length,research.candidateCount,research.rejectedCount,research.provider,research.model,run.id]);
+    await client.query(`UPDATE prospections SET list_id=$1,found_count=$2,candidate_count=$3,rejected_count=$4,status='completed',provider=$5,model=$6,error=$7,completed_at=NOW() WHERE id=$8`,[list.id,research.contacts.length,research.candidateCount,research.rejectedCount,research.provider,research.model,research.warning,run.id]);
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -669,19 +756,23 @@ app.post("/api/prospections", requireUser, async(req,res,next)=>{
 async function accountEmailSender(account, user) {
   if (!account || account.provider === "none") throw new Error("Configure uma conta Microsoft ou SMTP antes de enviar a campanha");
   if (account.provider === "microsoft") {
-    const ready = await refreshMicrosoftAccount(account);
+    if(!microsoftIntegrationConfigured())throw new Error("A integração Microsoft 365 ainda não está configurada no servidor");
+    if(account.connection_status!=="connected")throw new Error("Conecte e valide a conta Microsoft 365 antes de enviar");
+    let ready;
+    try{ready=await refreshMicrosoftAccount(account);}
+    catch(error){const message=String(error?.message||"Falha ao renovar a conta Microsoft").slice(0,500);await saveConnectionStatus(user.id,"failed",message);throw new Error(message);}
     return async ({to,subject,html}) => {
       const response = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", {method:"POST",headers:{authorization:`Bearer ${ready.accessToken}`,"content-type":"application/json"},body:JSON.stringify({message:{subject,body:{contentType:"HTML",content:html},toRecipients:[{emailAddress:{address:to}}],replyTo:account.reply_to?[{emailAddress:{address:account.reply_to}}]:undefined},saveToSentItems:true})});
-      if (!response.ok) { const body=await response.json().catch(()=>({})); throw new Error(body.error?.message||"Falha no envio Microsoft"); }
+      if (!response.ok) { const body=await response.json().catch(()=>({}));const message=body.error?.message||"Falha no envio Microsoft";if([401,403].includes(response.status))await saveConnectionStatus(user.id,"failed",message);throw new Error(message); }
       return "microsoft-accepted";
     };
   }
   if (account.provider === "smtp") {
-    if (!account.smtp_host || !account.smtp_user || !account.smtp_password_enc) throw new Error("Complete servidor, usuário e senha SMTP antes de enviar");
-    const transporter = nodemailer.createTransport({host:account.smtp_host,port:account.smtp_port||587,secure:Boolean(account.smtp_secure),auth:{user:account.smtp_user,pass:decryptSecret(account.smtp_password_enc)}});
+    if(account.connection_status!=="connected")throw new Error("Valide a conexão SMTP nas Configurações antes de enviar a campanha");
+    const transporter = smtpTransporter(account);
     return async ({to,subject,html}) => {
-      const result = await transporter.sendMail({from:`${account.display_name||user.name} <${account.email||account.smtp_user}>`,to,replyTo:account.reply_to||undefined,subject,html});
-      return result.messageId || "smtp-accepted";
+      try{const result = await transporter.sendMail({from:`${account.display_name||user.name} <${account.email||account.smtp_user}>`,to,replyTo:account.reply_to||undefined,subject,html});return result.messageId || "smtp-accepted";}
+      catch(error){const message=emailConnectionError(error,account);if(["EAUTH","ETIMEDOUT","ESOCKET","ECONNECTION","ECONNREFUSED","EDNS"].includes(String(error?.code||"").toUpperCase()))await saveConnectionStatus(user.id,"failed",message);throw new Error(message);}
     };
   }
   throw new Error("Provedor de envio não reconhecido");
@@ -694,7 +785,6 @@ async function sendWaveImmediately({campaignId,waveId,user}) {
   if (!bundle) throw new Error("O e-mail da primeira onda não foi encontrado");
   if (Number(bundle.wave_order) !== 1 || bundle.automation_mode !== "now") throw new Error("Enviar agora está disponível somente para a primeira onda");
   const account = (await pool.query(`SELECT * FROM user_email_settings WHERE user_id=$1`, [user.id])).rows[0];
-  const sendEmail = await accountEmailSender(account,user);
   const contacts = (await pool.query(`SELECT c.id,c.email,c.name,c.company FROM contact_list_members m JOIN contacts c ON c.id=m.contact_id
     WHERE m.list_id=$1 AND c.status='valid' AND c.subscribed=TRUE ORDER BY c.id`, [bundle.contact_list_id])).rows;
   if (!contacts.length) throw new Error("A lista não possui contatos válidos e autorizados para envio");
@@ -709,11 +799,24 @@ async function sendWaveImmediately({campaignId,waveId,user}) {
   await pool.query(`UPDATE campaign_waves SET status='sending' WHERE id=$1 AND status NOT IN ('completed')`, [waveId]);
   await pool.query(`UPDATE campaigns SET status='sending',updated_at=NOW() WHERE id=$1`, [campaignId]);
 
+  let sendEmail=null;
+  if(claimed.length){
+    try{sendEmail=await accountEmailSender(account,user);}
+    catch(error){
+      const message=String(error?.message||error).slice(0,1000);
+      await pool.query(`UPDATE campaign_deliveries SET status='failed',error=$1,updated_at=NOW() WHERE id=ANY($2::bigint[])`,[message,claimed.map((contact)=>contact.deliveryId)]);
+      await pool.query(`UPDATE campaign_waves SET status='failed' WHERE id=$1`,[waveId]);
+      await pool.query(`UPDATE campaign_emails SET status='failed',updated_at=NOW() WHERE wave_id=$1`,[waveId]);
+      await pool.query(`UPDATE campaigns SET status='failed',updated_at=NOW() WHERE id=$1`,[campaignId]);
+      return {sent:0,failed:claimed.length,total:contacts.length,skipped:Math.max(0,contacts.length-claimed.length),status:"failed",error:message};
+    }
+  }
+
   for (let index=0; index<claimed.length; index+=3) {
     const batch = claimed.slice(index,index+3);
     await Promise.all(batch.map(async contact => {
       try {
-        const html = personalizeCampaignHtml(bundle.html_content,contact,campaignId) + cleanHtml(account.signature_html);
+        const html = personalizeCampaignHtml(bundle.html_content,contact,campaignId) + cleanHtml(account?.signature_html);
         const messageId = await sendEmail({to:contact.email,subject:bundle.subject,html});
         await pool.query(`UPDATE campaign_deliveries SET status='sent',provider_message_id=$1,error=NULL,sent_at=NOW(),updated_at=NOW() WHERE id=$2`, [messageId,contact.deliveryId]);
         await pool.query(`INSERT INTO email_events(campaign_id,contact_id,event_type) VALUES($1,$2,'sent')`, [campaignId,contact.id]);
@@ -728,7 +831,7 @@ async function sendWaveImmediately({campaignId,waveId,user}) {
   const waveStatus=sent>=total?"completed":sent>0?"partial":"failed";
   await pool.query(`UPDATE campaign_waves SET status=$1 WHERE id=$2`, [waveStatus,waveId]);
   await pool.query(`UPDATE campaign_emails SET status=$1,updated_at=NOW() WHERE wave_id=$2`, [waveStatus,waveId]);
-  await pool.query(`UPDATE campaigns SET status=$1,updated_at=NOW() WHERE id=$2`, [sent>0?"active":"draft",campaignId]);
+  await pool.query(`UPDATE campaigns SET status=$1,updated_at=NOW() WHERE id=$2`, [sent>0?"active":failed>0?"failed":"draft",campaignId]);
   return {sent,failed,total,skipped:Math.max(0,total-claimed.length),status:waveStatus};
 }
 
@@ -761,7 +864,37 @@ app.put("/api/campaigns/:id/contact-list", requireUser, async(req,res,next)=>{
     }catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}
   }catch(error){next(error);}
 });
-app.get("/api/campaigns/:id/waves", requireUser, async(req,res,next)=>{try{const result=await pool.query(`SELECT w.id,w.wave_order,w.scheduled_at,w.recipient_count,w.automation_mode,w.delay_days,w.status,e.id email_id,e.subject,e.html_content,e.preview_text,e.editor_mode,e.layout_json,e.status email_status FROM campaign_waves w LEFT JOIN campaign_emails e ON e.wave_id=w.id WHERE w.campaign_id=$1 ORDER BY w.wave_order`,[req.params.id]);res.json({waves:result.rows});}catch(error){next(error);}});
+app.get("/api/campaigns/:id/waves", requireUser, async(req,res,next)=>{
+  try{
+    const result=await pool.query(`SELECT w.id,w.wave_order,w.scheduled_at,w.recipient_count,w.automation_mode,w.delay_days,w.status,
+      e.id email_id,e.subject,e.html_content,e.preview_text,e.editor_mode,e.layout_json,e.status email_status,
+      COALESCE(ds.delivery_total,0)::int delivery_total,COALESCE(ds.sent_count,0)::int sent_count,
+      COALESCE(ds.failed_count,0)::int failed_count,COALESCE(ds.sending_count,0)::int sending_count,
+      COALESCE(ds.pending_count,0)::int pending_count,
+      (SELECT d.error FROM campaign_deliveries d WHERE d.wave_id=w.id AND d.status='failed' AND d.error IS NOT NULL ORDER BY d.updated_at DESC LIMIT 1) latest_error
+      FROM campaign_waves w
+      LEFT JOIN campaign_emails e ON e.wave_id=w.id
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*) delivery_total,COUNT(*) FILTER(WHERE d.status='sent') sent_count,
+          COUNT(*) FILTER(WHERE d.status='failed') failed_count,COUNT(*) FILTER(WHERE d.status='sending') sending_count,
+          COUNT(*) FILTER(WHERE d.status='pending') pending_count
+        FROM campaign_deliveries d WHERE d.wave_id=w.id
+      ) ds ON TRUE
+      WHERE w.campaign_id=$1 ORDER BY w.wave_order`,[req.params.id]);
+    res.json({waves:result.rows});
+  }catch(error){next(error);}
+});
+app.get("/api/campaigns/:id/deliveries",requireUser,async(req,res,next)=>{
+  try{
+    const result=await pool.query(`SELECT d.id,d.status,d.provider_message_id,d.error,d.sent_at,d.created_at,d.updated_at,
+      w.id wave_id,w.wave_order,c.id contact_id,c.name contact_name,c.company,c.email
+      FROM campaign_deliveries d
+      JOIN campaign_waves w ON w.id=d.wave_id
+      JOIN contacts c ON c.id=d.contact_id
+      WHERE d.campaign_id=$1 ORDER BY w.wave_order,c.company NULLS LAST,c.email LIMIT 1000`,[req.params.id]);
+    res.json({deliveries:result.rows});
+  }catch(error){next(error);}
+});
 app.post("/api/campaigns/:id/waves/:waveId/email", requireUser, async(req,res,next)=>{const{subject,htmlContent="",previewText="",scheduledAt=null,automationMode="dated",delayDays=0,editorMode="visual",layout=[],sendNow=false}=req.body||{};if(!subject?.trim())return res.status(400).json({error:"O assunto é obrigatório"});if(/<script[\s>]/i.test(htmlContent))return res.status(400).json({error:"JavaScript não é permitido em e-mails"});if(!["now","dated","unopened","opened_no_click","no_reply"].includes(automationMode))return res.status(400).json({error:"Regra de envio inválida"});try{const wave=await pool.query(`SELECT id,wave_order,status FROM campaign_waves WHERE id=$1 AND campaign_id=$2`,[req.params.waveId,req.params.id]);if(!wave.rowCount)return res.status(404).json({error:"Onda não encontrada"});if(automationMode==="now"&&Number(wave.rows[0].wave_order)!==1)return res.status(400).json({error:"Enviar agora está disponível somente para a primeira onda"});if(sendNow&&automationMode!=="now")return res.status(400).json({error:"Confirme a regra Enviar agora antes do disparo"});await pool.query(`UPDATE campaign_waves SET scheduled_at=$1,automation_mode=$2,delay_days=$3 WHERE id=$4`,[automationMode==="dated"?scheduledAt:null,automationMode,Math.max(0,Number(delayDays)||0),req.params.waveId]);const saved=await pool.query(`INSERT INTO campaign_emails(campaign_id,wave_id,subject,html_content,preview_text,editor_mode,layout_json,status) VALUES($1,$2,$3,$4,$5,$6,$7,'ready') ON CONFLICT(campaign_id,wave_id) DO UPDATE SET subject=EXCLUDED.subject,html_content=EXCLUDED.html_content,preview_text=EXCLUDED.preview_text,editor_mode=EXCLUDED.editor_mode,layout_json=EXCLUDED.layout_json,status=CASE WHEN campaign_emails.status IN ('completed','partial') THEN campaign_emails.status ELSE 'ready' END,updated_at=NOW() RETURNING *`,[req.params.id,req.params.waveId,subject.trim(),htmlContent,previewText,editorMode,JSON.stringify(Array.isArray(layout)?layout:[])]);await pool.query(`UPDATE campaigns SET subject=$1,updated_at=NOW() WHERE id=$2`,[subject.trim(),req.params.id]);const delivery=sendNow?await sendWaveImmediately({campaignId:req.params.id,waveId:req.params.waveId,user:req.user}):null;res.status(201).json({email:saved.rows[0],delivery});}catch(error){next(error);}});
 app.post("/api/campaigns/:id/duplicate", requireUser, async(req,res,next)=>{try{const original=(await pool.query(`SELECT * FROM campaigns WHERE id=$1`,[req.params.id])).rows[0];if(!original)return res.status(404).json({error:"Campanha não encontrada"});const client=await pool.connect();try{await client.query("BEGIN");const copy=(await client.query(`INSERT INTO campaigns(name,subject,html_content,brief,source_references,sender_name,sender_email,audience_label,contact_list_id,owner_id,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'draft') RETURNING *`,[`${original.name} — cópia`,original.subject,original.html_content,original.brief,original.source_references,original.sender_name,original.sender_email,original.audience_label,original.contact_list_id,req.user.id])).rows[0];const waves=(await client.query(`SELECT * FROM campaign_waves WHERE campaign_id=$1 ORDER BY wave_order`,[original.id])).rows;for(const wave of waves){const newWave=(await client.query(`INSERT INTO campaign_waves(campaign_id,wave_order,scheduled_at,recipient_count,automation_mode,delay_days,status) VALUES($1,$2,NULL,$3,$4,$5,'draft') RETURNING id`,[copy.id,wave.wave_order,wave.recipient_count,wave.automation_mode,wave.delay_days])).rows[0];const email=(await client.query(`SELECT * FROM campaign_emails WHERE wave_id=$1`,[wave.id])).rows[0];if(email)await client.query(`INSERT INTO campaign_emails(campaign_id,wave_id,subject,html_content,preview_text,editor_mode,layout_json,status) VALUES($1,$2,$3,$4,$5,$6,$7,'draft')`,[copy.id,newWave.id,email.subject,email.html_content,email.preview_text,email.editor_mode,email.layout_json]);}await client.query("COMMIT");res.status(201).json({campaign:copy});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();}}catch(error){next(error);}});
 app.delete("/api/campaigns/:id", requireUser, async(req,res,next)=>{try{await pool.query(`DELETE FROM campaigns WHERE id=$1`,[req.params.id]);res.json({ok:true});}catch(error){next(error);}});
@@ -770,8 +903,61 @@ app.get("/api/templates", requireUser, async(req,res,next)=>{try{const result=aw
 app.post("/api/templates", requireUser, async(req,res,next)=>{const name=String(req.body?.name||"").trim(),type=String(req.body?.templateType||"").trim(),html=cleanHtml(req.body?.htmlContent);if(!name||!["header","body","footer","complete"].includes(type)||!html)return res.status(400).json({error:"Informe nome, tipo e conteúdo do modelo"});try{const result=await pool.query(`INSERT INTO email_templates(user_id,name,template_type,html_content) VALUES($1,$2,$3,$4) RETURNING *`,[req.user.id,name,type,html]);res.status(201).json({template:result.rows[0]});}catch(error){next(error);}});
 app.delete("/api/templates/:id", requireUser, async(req,res,next)=>{try{await pool.query(`DELETE FROM email_templates WHERE id=$1 AND user_id=$2`,[req.params.id,req.user.id]);res.json({ok:true});}catch(error){next(error);}});
 
-app.get("/api/settings/email", requireUser, async(req,res,next)=>{try{const result=await pool.query(`SELECT provider,email,display_name,reply_to,signature_html,signature_text,smtp_host,smtp_port,smtp_secure,smtp_user,connected_at,updated_at FROM user_email_settings WHERE user_id=$1`,[req.user.id]);res.json({settings:result.rows[0]||{provider:"none",email:req.user.email,display_name:req.user.name,signature_html:"",signature_text:""}});}catch(error){next(error);}});
-app.put("/api/settings/email", requireUser, async(req,res,next)=>{const body=req.body||{};const provider=["none","smtp","microsoft"].includes(body.provider)?body.provider:"none";try{const current=(await pool.query(`SELECT smtp_password_enc FROM user_email_settings WHERE user_id=$1`,[req.user.id])).rows[0];const password=body.smtpPassword?encryptSecret(body.smtpPassword):current?.smtp_password_enc||null;const result=await pool.query(`INSERT INTO user_email_settings(user_id,provider,email,display_name,reply_to,signature_html,signature_text,smtp_host,smtp_port,smtp_secure,smtp_user,smtp_password_enc,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW()) ON CONFLICT(user_id) DO UPDATE SET provider=EXCLUDED.provider,email=EXCLUDED.email,display_name=EXCLUDED.display_name,reply_to=EXCLUDED.reply_to,signature_html=EXCLUDED.signature_html,signature_text=EXCLUDED.signature_text,smtp_host=EXCLUDED.smtp_host,smtp_port=EXCLUDED.smtp_port,smtp_secure=EXCLUDED.smtp_secure,smtp_user=EXCLUDED.smtp_user,smtp_password_enc=EXCLUDED.smtp_password_enc,updated_at=NOW() RETURNING provider,email,display_name,reply_to,signature_html,signature_text,smtp_host,smtp_port,smtp_secure,smtp_user,connected_at,updated_at`,[req.user.id,provider,String(body.email||req.user.email),String(body.displayName||req.user.name),String(body.replyTo||""),cleanHtml(body.signatureHtml),String(body.signatureText||""),String(body.smtpHost||""),Number(body.smtpPort)||587,Boolean(body.smtpSecure),String(body.smtpUser||""),password]);res.json({settings:result.rows[0]});}catch(error){next(error);}});
+function microsoftIntegrationConfigured(){return Boolean(process.env.MICROSOFT_TENANT_ID&&process.env.MICROSOFT_CLIENT_ID&&process.env.MICROSOFT_CLIENT_SECRET);}
+function smtpTransporter(account){
+  if(!account?.smtp_host||!account?.smtp_user||!account?.smtp_password_enc)throw new Error("Complete servidor, usuário e senha SMTP antes de testar a conexão");
+  return nodemailer.createTransport({
+    host:account.smtp_host,port:account.smtp_port||587,secure:Boolean(account.smtp_secure),
+    auth:{user:account.smtp_user,pass:decryptSecret(account.smtp_password_enc)},
+    connectionTimeout:15000,greetingTimeout:10000,socketTimeout:20000
+  });
+}
+function emailConnectionError(error,account){
+  const code=String(error?.code||"").toUpperCase(),responseCode=Number(error?.responseCode||0);
+  if(code==="EAUTH"||[534,535].includes(responseCode))return "Autenticação SMTP recusada. Confira o usuário e use uma senha de aplicativo quando o provedor exigir.";
+  if(["ETIMEDOUT","ESOCKET","ECONNECTION","ECONNREFUSED","EHOSTUNREACH"].includes(code))return `Não foi possível conectar a ${account?.smtp_host||"servidor SMTP"}:${account?.smtp_port||587}. Confira host, porta e a opção SSL.`;
+  if(code==="EDNS")return "O endereço do servidor SMTP não foi encontrado. Confira o host informado.";
+  return String(error?.message||"Falha ao validar a conta de envio").slice(0,500);
+}
+async function saveConnectionStatus(userId,status,error=null){
+  await pool.query(`UPDATE user_email_settings SET connection_status=$1,connection_error=$2,connection_checked_at=NOW(),connected_at=CASE WHEN provider='microsoft' AND $1='connected' THEN NOW() WHEN provider='microsoft' THEN connected_at ELSE NULL END,updated_at=NOW() WHERE user_id=$3`,[status,error,userId]);
+}
+
+app.get("/api/settings/email", requireUser, async(req,res,next)=>{
+  try{
+    const result=await pool.query(`SELECT provider,email,display_name,reply_to,signature_html,signature_text,smtp_host,smtp_port,smtp_secure,smtp_user,connected_at,connection_status,connection_error,connection_checked_at,updated_at FROM user_email_settings WHERE user_id=$1`,[req.user.id]);
+    res.json({settings:result.rows[0]||{provider:"none",email:req.user.email,display_name:req.user.name,signature_html:"",signature_text:"",connection_status:"not_configured"}});
+  }catch(error){next(error);}
+});
+app.put("/api/settings/email", requireUser, async(req,res,next)=>{
+  const body=req.body||{};const provider=["none","smtp","microsoft"].includes(body.provider)?body.provider:"none";
+  try{
+    const current=(await pool.query(`SELECT provider,smtp_host,smtp_port,smtp_secure,smtp_user,smtp_password_enc,connected_at,connection_status FROM user_email_settings WHERE user_id=$1`,[req.user.id])).rows[0];
+    const password=body.smtpPassword?encryptSecret(body.smtpPassword):current?.smtp_password_enc||null;
+    const smtpChanged=provider==="smtp"&&(!current||current.provider!=="smtp"||String(body.smtpHost||"")!==String(current.smtp_host||"")||(Number(body.smtpPort)||587)!==Number(current.smtp_port||587)||Boolean(body.smtpSecure)!==Boolean(current.smtp_secure)||String(body.smtpUser||"")!==String(current.smtp_user||"")||Boolean(body.smtpPassword));
+    const connectionStatus=provider==="smtp"?(smtpChanged?"untested":current?.provider==="smtp"?current.connection_status||"untested":"untested"):provider==="microsoft"&&current?.provider==="microsoft"&&current?.connected_at?current.connection_status||"connected":"not_configured";
+    const result=await pool.query(`INSERT INTO user_email_settings(user_id,provider,email,display_name,reply_to,signature_html,signature_text,smtp_host,smtp_port,smtp_secure,smtp_user,smtp_password_enc,connection_status,connection_error,connection_checked_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULL,NULL,NOW()) ON CONFLICT(user_id) DO UPDATE SET provider=EXCLUDED.provider,email=EXCLUDED.email,display_name=EXCLUDED.display_name,reply_to=EXCLUDED.reply_to,signature_html=EXCLUDED.signature_html,signature_text=EXCLUDED.signature_text,smtp_host=EXCLUDED.smtp_host,smtp_port=EXCLUDED.smtp_port,smtp_secure=EXCLUDED.smtp_secure,smtp_user=EXCLUDED.smtp_user,smtp_password_enc=EXCLUDED.smtp_password_enc,connected_at=CASE WHEN EXCLUDED.provider='microsoft' THEN user_email_settings.connected_at ELSE NULL END,connection_status=EXCLUDED.connection_status,connection_error=CASE WHEN EXCLUDED.provider=user_email_settings.provider AND EXCLUDED.connection_status=user_email_settings.connection_status THEN user_email_settings.connection_error ELSE NULL END,connection_checked_at=CASE WHEN EXCLUDED.provider=user_email_settings.provider AND EXCLUDED.connection_status=user_email_settings.connection_status THEN user_email_settings.connection_checked_at ELSE NULL END,updated_at=NOW() RETURNING provider,email,display_name,reply_to,signature_html,signature_text,smtp_host,smtp_port,smtp_secure,smtp_user,connected_at,connection_status,connection_error,connection_checked_at,updated_at`,[req.user.id,provider,String(body.email||req.user.email),String(body.displayName||req.user.name),String(body.replyTo||""),cleanHtml(body.signatureHtml),String(body.signatureText||""),String(body.smtpHost||""),Number(body.smtpPort)||587,Boolean(body.smtpSecure),String(body.smtpUser||""),password,connectionStatus]);
+    res.json({settings:result.rows[0]});
+  }catch(error){next(error);}
+});
+
+app.post("/api/settings/email/verify",requireUser,async(req,res,next)=>{
+  try{
+    const account=(await pool.query(`SELECT * FROM user_email_settings WHERE user_id=$1`,[req.user.id])).rows[0];
+    if(!account||account.provider==="none")return res.status(409).json({error:"Escolha e salve um provedor de envio antes de testar"});
+    if(account.provider==="smtp"){
+      try{await smtpTransporter(account).verify();await saveConnectionStatus(req.user.id,"connected");return res.json({status:"connected",provider:"smtp",message:"Conexão e autenticação SMTP validadas."});}
+      catch(error){const message=emailConnectionError(error,account);await saveConnectionStatus(req.user.id,"failed",message);return res.status(422).json({status:"failed",provider:"smtp",error:message});}
+    }
+    if(!microsoftIntegrationConfigured())return res.status(503).json({status:"unavailable",provider:"microsoft",error:"A integração Microsoft 365 ainda não está configurada no servidor."});
+    try{
+      const ready=await refreshMicrosoftAccount(account);
+      const response=await fetch("https://graph.microsoft.com/v1.0/me?$select=id,mail,userPrincipalName",{headers:{authorization:`Bearer ${ready.accessToken}`},signal:AbortSignal.timeout(15000)});
+      if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error?.message||"A Microsoft recusou a conexão");}
+      await saveConnectionStatus(req.user.id,"connected");return res.json({status:"connected",provider:"microsoft",message:"Conta Microsoft 365 conectada e autorizada."});
+    }catch(error){const message=String(error?.message||"Falha ao validar a conta Microsoft").slice(0,500);await saveConnectionStatus(req.user.id,"failed",message);return res.status(422).json({status:"failed",provider:"microsoft",error:message});}
+  }catch(error){next(error);}
+});
 
 function microsoftRedirectUri(){return `${frontendUrl.replace(/\/$/,"")}/api/abr/microsoft/callback`;}
 async function refreshMicrosoftAccount(account){
@@ -779,13 +965,17 @@ async function refreshMicrosoftAccount(account){
   const refreshToken=decryptSecret(account.microsoft_refresh_token_enc);if(!refreshToken)throw new Error("Reconecte sua conta Microsoft");
   const tenant=process.env.MICROSOFT_TENANT_ID;const response=await fetch(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`,{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams({client_id:process.env.MICROSOFT_CLIENT_ID||"",client_secret:process.env.MICROSOFT_CLIENT_SECRET||"",grant_type:"refresh_token",refresh_token:refreshToken,scope:"offline_access User.Read Mail.Read Mail.Send"})});const token=await response.json();if(!response.ok)throw new Error(token.error_description||"Não foi possível renovar a conta Microsoft");const expires=new Date(Date.now()+Number(token.expires_in||3600)*1000);await pool.query(`UPDATE user_email_settings SET microsoft_access_token_enc=$1,microsoft_refresh_token_enc=COALESCE($2,microsoft_refresh_token_enc),microsoft_expires_at=$3,updated_at=NOW() WHERE user_id=$4`,[encryptSecret(token.access_token),token.refresh_token?encryptSecret(token.refresh_token):null,expires,account.user_id]);return{...account,accessToken:token.access_token,microsoft_expires_at:expires};
 }
-app.post("/api/microsoft/connect", requireUser, async(req,res,next)=>{try{if(!process.env.MICROSOFT_TENANT_ID||!process.env.MICROSOFT_CLIENT_ID||!process.env.MICROSOFT_CLIENT_SECRET)return res.status(503).json({error:"A integração Microsoft ainda não foi configurada no servidor"});const state=randomToken(24);await pool.query(`INSERT INTO oauth_states(state_hash,user_id,expires_at) VALUES($1,$2,NOW()+INTERVAL '10 minutes')`,[tokenHash(state),req.user.id]);const url=new URL(`https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize`);url.search=new URLSearchParams({client_id:process.env.MICROSOFT_CLIENT_ID,response_type:"code",redirect_uri:microsoftRedirectUri(),response_mode:"query",scope:"offline_access User.Read Mail.Read Mail.Send",state}).toString();res.json({authorizeUrl:url.toString()});}catch(error){next(error);}});
-app.get("/api/microsoft/callback", async(req,res)=>{const code=String(req.query.code||""),state=String(req.query.state||"");try{const saved=(await pool.query(`DELETE FROM oauth_states WHERE state_hash=$1 AND expires_at>NOW() RETURNING user_id`,[tokenHash(state)])).rows[0];if(!saved||!code)throw new Error("Autorização expirada ou inválida");const response=await fetch(`https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`,{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams({client_id:process.env.MICROSOFT_CLIENT_ID||"",client_secret:process.env.MICROSOFT_CLIENT_SECRET||"",code,redirect_uri:microsoftRedirectUri(),grant_type:"authorization_code",scope:"offline_access User.Read Mail.Read Mail.Send"})});const token=await response.json();if(!response.ok)throw new Error(token.error_description||"Falha ao conectar Microsoft");const profileResponse=await fetch("https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName",{headers:{authorization:`Bearer ${token.access_token}`}});const profile=await profileResponse.json();await pool.query(`INSERT INTO user_email_settings(user_id,provider,email,display_name,microsoft_access_token_enc,microsoft_refresh_token_enc,microsoft_expires_at,connected_at,updated_at) VALUES($1,'microsoft',$2,$3,$4,$5,$6,NOW(),NOW()) ON CONFLICT(user_id) DO UPDATE SET provider='microsoft',email=EXCLUDED.email,display_name=EXCLUDED.display_name,microsoft_access_token_enc=EXCLUDED.microsoft_access_token_enc,microsoft_refresh_token_enc=EXCLUDED.microsoft_refresh_token_enc,microsoft_expires_at=EXCLUDED.microsoft_expires_at,connected_at=NOW(),updated_at=NOW()`,[saved.user_id,profile.mail||profile.userPrincipalName,profile.displayName,encryptSecret(token.access_token),encryptSecret(token.refresh_token),new Date(Date.now()+Number(token.expires_in||3600)*1000)]);res.redirect(`${frontendUrl}/?microsoft=connected`);}catch(error){res.redirect(`${frontendUrl}/?microsoft=error&detail=${encodeURIComponent(error.message)}`);}});
-app.post("/api/microsoft/disconnect", requireUser, async(req,res,next)=>{try{await pool.query(`UPDATE user_email_settings SET provider='none',microsoft_access_token_enc=NULL,microsoft_refresh_token_enc=NULL,microsoft_expires_at=NULL,connected_at=NULL WHERE user_id=$1`,[req.user.id]);res.json({ok:true});}catch(error){next(error);}});
+app.post("/api/microsoft/connect", requireUser, async(req,res,next)=>{try{if(!microsoftIntegrationConfigured())return res.status(503).json({error:"A integração Microsoft ainda não foi configurada no servidor"});const state=randomToken(24);await pool.query(`INSERT INTO oauth_states(state_hash,user_id,expires_at) VALUES($1,$2,NOW()+INTERVAL '10 minutes')`,[tokenHash(state),req.user.id]);const url=new URL(`https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize`);url.search=new URLSearchParams({client_id:process.env.MICROSOFT_CLIENT_ID,response_type:"code",redirect_uri:microsoftRedirectUri(),response_mode:"query",scope:"offline_access User.Read Mail.Read Mail.Send",state}).toString();res.json({authorizeUrl:url.toString()});}catch(error){next(error);}});
+app.get("/api/microsoft/callback", async(req,res)=>{const code=String(req.query.code||""),state=String(req.query.state||"");try{const saved=(await pool.query(`DELETE FROM oauth_states WHERE state_hash=$1 AND expires_at>NOW() RETURNING user_id`,[tokenHash(state)])).rows[0];if(!saved||!code)throw new Error("Autorização expirada ou inválida");const response=await fetch(`https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`,{method:"POST",headers:{"content-type":"application/x-www-form-urlencoded"},body:new URLSearchParams({client_id:process.env.MICROSOFT_CLIENT_ID||"",client_secret:process.env.MICROSOFT_CLIENT_SECRET||"",code,redirect_uri:microsoftRedirectUri(),grant_type:"authorization_code",scope:"offline_access User.Read Mail.Read Mail.Send"})});const token=await response.json();if(!response.ok)throw new Error(token.error_description||"Falha ao conectar Microsoft");const profileResponse=await fetch("https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName",{headers:{authorization:`Bearer ${token.access_token}`}});const profile=await profileResponse.json();await pool.query(`INSERT INTO user_email_settings(user_id,provider,email,display_name,microsoft_access_token_enc,microsoft_refresh_token_enc,microsoft_expires_at,connected_at,connection_status,connection_error,connection_checked_at,updated_at) VALUES($1,'microsoft',$2,$3,$4,$5,$6,NOW(),'connected',NULL,NOW(),NOW()) ON CONFLICT(user_id) DO UPDATE SET provider='microsoft',email=EXCLUDED.email,display_name=EXCLUDED.display_name,microsoft_access_token_enc=EXCLUDED.microsoft_access_token_enc,microsoft_refresh_token_enc=EXCLUDED.microsoft_refresh_token_enc,microsoft_expires_at=EXCLUDED.microsoft_expires_at,connected_at=NOW(),connection_status='connected',connection_error=NULL,connection_checked_at=NOW(),updated_at=NOW()`,[saved.user_id,profile.mail||profile.userPrincipalName,profile.displayName,encryptSecret(token.access_token),encryptSecret(token.refresh_token),new Date(Date.now()+Number(token.expires_in||3600)*1000)]);res.redirect(`${frontendUrl}/?microsoft=connected`);}catch(error){res.redirect(`${frontendUrl}/?microsoft=error&detail=${encodeURIComponent(error.message)}`);}});
+app.post("/api/microsoft/disconnect", requireUser, async(req,res,next)=>{try{await pool.query(`UPDATE user_email_settings SET provider='none',microsoft_access_token_enc=NULL,microsoft_refresh_token_enc=NULL,microsoft_expires_at=NULL,connected_at=NULL,connection_status='not_configured',connection_error=NULL,connection_checked_at=NOW() WHERE user_id=$1`,[req.user.id]);res.json({ok:true});}catch(error){next(error);}});
 app.get("/api/inbox", requireUser, async(req,res,next)=>{try{const account=(await pool.query(`SELECT * FROM user_email_settings WHERE user_id=$1`,[req.user.id])).rows[0];if(!account||account.provider!=="microsoft")return res.status(409).json({error:"Conecte uma conta Microsoft para receber as respostas no sistema"});const ready=await refreshMicrosoftAccount(account);const response=await fetch("https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages?$top=50&$orderby=receivedDateTime%20desc&$select=id,subject,from,receivedDateTime,isRead,bodyPreview,webLink",{headers:{authorization:`Bearer ${ready.accessToken}`}});const body=await response.json();if(!response.ok)throw new Error(body.error?.message||"Não foi possível sincronizar a caixa de entrada");res.json({messages:(body.value||[]).map((item)=>({id:item.id,subject:item.subject,fromName:item.from?.emailAddress?.name,fromEmail:item.from?.emailAddress?.address,receivedAt:item.receivedDateTime,isRead:item.isRead,preview:item.bodyPreview,webLink:item.webLink}))});}catch(error){next(error);}});
 app.post("/api/email/test", requireUser, async(req,res,next)=>{try{const account=(await pool.query(`SELECT * FROM user_email_settings WHERE user_id=$1`,[req.user.id])).rows[0];if(!account)return res.status(409).json({error:"Configure sua conta de envio"});const to=String(req.body?.to||account.email||req.user.email),subject=String(req.body?.subject||"Teste do Email Bomber"),content=cleanHtml(req.body?.htmlContent||"<p>Seu e-mail está configurado corretamente.</p>")+cleanHtml(account.signature_html);const sendEmail=await accountEmailSender(account,req.user);await sendEmail({to,subject,html:content});res.json({ok:true,to});}catch(error){next(error);}});
 
 app.get("/api/admins", requireUser, async(_req,res,next)=>{try{const result=await pool.query(`SELECT email,name,role,status,created_at FROM users WHERE role='admin' ORDER BY created_at`);res.json({admins:result.rows});}catch(error){next(error);}});
 app.use((error,_req,res,_next)=>{console.error(error);res.status(500).json({error:error.message||"Erro interno"});});
 app.use((_req,res)=>res.status(404).json({error:"Rota não encontrada"}));
-app.listen(port,"0.0.0.0",()=>console.log(`Email Bomber API ouvindo na porta ${port}`));
+app.listen(port,"0.0.0.0",()=>{
+  const providers=[process.env.GROQ_API_KEY&&"Groq",process.env.GEMINI_API_KEY&&"Gemini"].filter(Boolean);
+  console.log(`Email Bomber API ouvindo na porta ${port}`);
+  console.log(`Provedores de Prospecção ativos: ${providers.join(" + ")||"nenhum"}`);
+});
