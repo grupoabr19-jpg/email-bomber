@@ -114,16 +114,16 @@ function personalizeCampaignHtml(html, contact, campaignId) {
     .replaceAll("{{unsubscribe_url}}", unsubscribeUrl);
 }
 function normalizeContact(item) {
-  const email = String(item.email || item.Email || item["E-mail"] || "").trim().toLowerCase();
+  const email = String(item.email || item.Email || item["E-mail"] || item["e-mail"] || item.e_mail || "").trim().toLowerCase();
   return {
     email,
     name: String(item.name || item.nome || item.Nome || "").trim(),
     company: String(item.company || item.empresa || item.Empresa || "").trim(),
     segment: String(item.segment || item.segmento || item.Segmento || "").trim(),
     city: String(item.city || item.cidade || item.Cidade || "").trim(),
-    region: String(item.region || item.regiao || item.Região || "").trim(),
+    region: String(item.region || item.regiao || item.região || item.Região || "").trim(),
     website: String(item.website || item.site || "").trim(),
-    sourceUrl: String(item.source_url || item.sourceUrl || item.fonte || "").trim(),
+    sourceUrl: String(item.source_url || item.sourceUrl || item.sourceurl || item["source url"] || item.fonte || "").trim(),
     qualificationScore: Math.max(0, Math.min(100, Number(item.qualification_score || item.qualificationScore || 0))),
     qualificationLabel: String(item.qualification_label || item.qualificationLabel || "a revisar").trim(),
     qualificationReason: String(item.qualification_reason || item.qualificationReason || "").trim(),
@@ -395,7 +395,7 @@ app.get("/api/dashboard", requireUser, async (_req, res, next) => {
 });
 
 app.get("/api/contacts", requireUser, async (req,res,next)=>{
-  try { const term=String(req.query.search||"").trim(); const result=await pool.query(`SELECT id,name,email,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle,status,subscribed,created_at FROM contacts WHERE($1='' OR name ILIKE '%'||$1||'%' OR email ILIKE '%'||$1||'%' OR company ILIKE '%'||$1||'%') ORDER BY created_at DESC LIMIT 500`,[term]); res.json({contacts:result.rows}); } catch(error){next(error);}
+  try { const term=String(req.query.search||"").trim(); const result=await pool.query(`SELECT id,name,email,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle,status,subscribed,created_at FROM contacts WHERE($1='' OR name ILIKE '%'||$1||'%' OR email ILIKE '%'||$1||'%' OR company ILIKE '%'||$1||'%') ORDER BY created_at DESC LIMIT 5000`,[term]); res.json({contacts:result.rows}); } catch(error){next(error);}
 });
 app.post("/api/contacts/import", requireUser, async (req,res,next)=>{
   const items=Array.isArray(req.body?.contacts)?req.body.contacts.map(normalizeContact).filter((item)=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(item.email)):[];
@@ -463,8 +463,53 @@ app.get("/api/contact-lists/:id", requireUser, async(req,res,next)=>{
   try { const list=(await pool.query(`SELECT l.*,COUNT(m.contact_id)::int contacts FROM contact_lists l LEFT JOIN contact_list_members m ON m.list_id=l.id WHERE l.id=$1 GROUP BY l.id`,[req.params.id])).rows[0]; if(!list)return res.status(404).json({error:"Lista não encontrada"}); const contacts=(await pool.query(`SELECT c.* FROM contacts c JOIN contact_list_members m ON m.contact_id=c.id WHERE m.list_id=$1 ORDER BY c.qualification_score DESC,c.company`,[req.params.id])).rows; res.json({list,contacts}); }catch(error){next(error);}
 });
 app.post("/api/contact-lists", requireUser, async(req,res,next)=>{
-  const {name,niche="",region="",qualification="qualified",source="manual",criteria="",contactIds=[]}=req.body||{}; if(!name?.trim())return res.status(400).json({error:"O nome da lista é obrigatório"});
-  try { const client=await pool.connect(); try{await client.query("BEGIN"); const list=(await client.query(`INSERT INTO contact_lists(name,niche,region,qualification,source,criteria,created_by) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[name.trim(),niche,region,qualification,source,criteria,req.user.id])).rows[0]; for(const id of Array.isArray(contactIds)?contactIds:[])await client.query(`INSERT INTO contact_list_members(list_id,contact_id) VALUES($1,$2) ON CONFLICT DO NOTHING`,[list.id,id]); await client.query("COMMIT");res.status(201).json({list});}catch(error){await client.query("ROLLBACK");throw error;}finally{client.release();} }catch(error){next(error);}
+  const body=req.body||{};
+  const name=String(body.name||"").trim(),niche=String(body.niche||"").trim(),region=String(body.region||"").trim(),criteria=String(body.criteria||"").trim();
+  const contactIds=[...new Set((Array.isArray(body.contactIds)?body.contactIds:[]).map(Number).filter((id)=>Number.isInteger(id)&&id>0))].slice(0,10000);
+  const rawContacts=Array.isArray(body.contacts)?body.contacts.slice(0,10000):[];
+  const normalized=rawContacts.map(normalizeContact).filter((item)=>emailIsValid(item.email));
+  const importedContacts=[...new Map(normalized.map((item)=>[item.email,item])).values()];
+  if(!name)return res.status(400).json({error:"O nome da lista é obrigatório"});
+  if(!contactIds.length&&!importedContacts.length)return res.status(400).json({error:"Selecione contatos da base ou importe um CSV com e-mails válidos"});
+  const client=await pool.connect();
+  try{
+    await client.query("BEGIN");
+    const source=importedContacts.length?"csv":"manual";
+    const list=(await client.query(`INSERT INTO contact_lists(name,niche,region,qualification,source,criteria,created_by) VALUES($1,$2,$3,'manual',$4,$5,$6) RETURNING *`,[name,niche,region,source,criteria,req.user.id])).rows[0];
+    let selected=0,created=0,updated=0;
+    if(contactIds.length){
+      selected=(await client.query(`INSERT INTO contact_list_members(list_id,contact_id) SELECT $1,id FROM contacts WHERE id=ANY($2::bigint[]) ON CONFLICT DO NOTHING RETURNING contact_id`,[list.id,contactIds])).rowCount;
+    }
+    if(importedContacts.length){
+      const emails=importedContacts.map((item)=>item.email);
+      const existing=new Set((await client.query(`SELECT email FROM contacts WHERE email=ANY($1::text[])`,[emails])).rows.map((item)=>item.email));
+      created=emails.filter((email)=>!existing.has(email)).length;
+      updated=emails.length-created;
+      const payload=importedContacts.map((item)=>({
+        email:item.email,name:item.name,company:item.company,segment:item.segment,city:item.city,region:item.region,
+        website:item.website,source_url:item.sourceUrl,qualification_score:item.qualificationScore,qualification_label:item.qualificationLabel,
+        qualification_reason:item.qualificationReason,suggested_angle:item.suggestedAngle
+      }));
+      await client.query(`WITH incoming AS (
+          SELECT * FROM jsonb_to_recordset($1::jsonb) AS item(email TEXT,name TEXT,company TEXT,segment TEXT,city TEXT,region TEXT,website TEXT,source_url TEXT,qualification_score INTEGER,qualification_label TEXT,qualification_reason TEXT,suggested_angle TEXT)
+        ), upserted AS (
+          INSERT INTO contacts(email,name,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle)
+          SELECT email,name,company,segment,city,region,website,source_url,qualification_score,qualification_label,qualification_reason,suggested_angle FROM incoming
+          ON CONFLICT(email) DO UPDATE SET
+            name=COALESCE(NULLIF(EXCLUDED.name,''),contacts.name),company=COALESCE(NULLIF(EXCLUDED.company,''),contacts.company),
+            segment=COALESCE(NULLIF(EXCLUDED.segment,''),contacts.segment),city=COALESCE(NULLIF(EXCLUDED.city,''),contacts.city),
+            region=COALESCE(NULLIF(EXCLUDED.region,''),contacts.region),website=COALESCE(NULLIF(EXCLUDED.website,''),contacts.website),
+            source_url=COALESCE(NULLIF(EXCLUDED.source_url,''),contacts.source_url),qualification_score=CASE WHEN EXCLUDED.qualification_score>0 THEN EXCLUDED.qualification_score ELSE contacts.qualification_score END,
+            qualification_label=CASE WHEN EXCLUDED.qualification_label<>'a revisar' THEN EXCLUDED.qualification_label ELSE contacts.qualification_label END,
+            qualification_reason=COALESCE(NULLIF(EXCLUDED.qualification_reason,''),contacts.qualification_reason),suggested_angle=COALESCE(NULLIF(EXCLUDED.suggested_angle,''),contacts.suggested_angle),updated_at=NOW()
+          RETURNING id
+        )
+        INSERT INTO contact_list_members(list_id,contact_id) SELECT $2,id FROM upserted ON CONFLICT DO NOTHING`,[JSON.stringify(payload),list.id]);
+    }
+    const linked=number((await client.query(`SELECT COUNT(*) FROM contact_list_members WHERE list_id=$1`,[list.id])).rows[0].count);
+    await client.query("COMMIT");
+    res.status(201).json({list,linked,selected,created,updated,rejected:Math.max(0,rawContacts.length-normalized.length),duplicates:Math.max(0,normalized.length-importedContacts.length)});
+  }catch(error){await client.query("ROLLBACK");next(error);}finally{client.release();}
 });
 app.put("/api/contact-lists/:id",requireUser,async(req,res,next)=>{
   const name=String(req.body?.name||"").trim(),niche=String(req.body?.niche||"").trim(),region=String(req.body?.region||"").trim(),criteria=String(req.body?.criteria||"").trim();
@@ -978,4 +1023,5 @@ app.listen(port,"0.0.0.0",()=>{
   const providers=[process.env.GROQ_API_KEY&&"Groq",process.env.GEMINI_API_KEY&&"Gemini"].filter(Boolean);
   console.log(`Email Bomber API ouvindo na porta ${port}`);
   console.log(`Provedores de Prospecção ativos: ${providers.join(" + ")||"nenhum"}`);
+  console.log(`Integração Microsoft 365: ${microsoftIntegrationConfigured()?"configurada":"não configurada"}`);
 });
